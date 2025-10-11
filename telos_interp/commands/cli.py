@@ -74,10 +74,23 @@ def gather_grid_activations_last_prompt(
             help="Path to a grid CSV file with columns: env_idx, observation, x, y, cell_type, symbol, classes_map, optimal_trajectory_length",
         ),
     ],
-    layer: Annotated[int, typer.Option(help="Which layer to extract activations from")],
+    layers: Annotated[list[int], typer.Option(help="Which layer to extract activations from")],
+    out_path: Annotated[
+        str | None,
+        typer.Argument(
+            ...,
+            help="Folder where activations will be saved.",
+        ),
+    ] = None,
+    normalize: Annotated[
+        bool, typer.Option("--normalize/--no-normalize", help="Whether to normalize embeddings before saving")
+    ] = False,
 ):
-    results_path = activations.gather_activations_from_grid_at_last_prompt_token(model_name_or_path, csv_path, layer)
-    typer.echo(f"Grid activations (last prompt) saved to {results_path}")
+    for layer in layers:
+        results_path = activations.gather_activations_from_grid_at_last_prompt_token(
+            model_name_or_path, csv_path, layer, normalize, out_path
+        )
+        typer.echo(f"Grid activations (last prompt) saved to {results_path}")
 
 
 @app.command("train-multiclass-probe", help="Train a multi-class probing classifier on grid cell activations")

@@ -128,7 +128,9 @@ def run_model_and_gather_activations_at_token_position(
     return all_layer_outputs
 
 
-def gather_activations_from_grid_at_last_prompt_token(model_name_or_path: str, csv_path: str, layer: int = 12) -> str:
+def gather_activations_from_grid_at_last_prompt_token(
+    model_name_or_path: str, csv_path: str, layer: int = 1, normalize: bool = False, out_path: str | None = None
+) -> str:
     """Gather activations using only the last prompt token for all cell types from grid CSV data.
 
     This function extracts activations only at the last prompt token position and groups
@@ -165,6 +167,7 @@ def gather_activations_from_grid_at_last_prompt_token(model_name_or_path: str, c
             model, grid_text, empty_response, TokenPosition.prompt_last
         )  # (num_layers, hidden_dim)
         last_prompt_activation = all_layer_activations[layer]  # Shape: (hidden_dim,)
+
         hidden_size = last_prompt_activation.shape[0]
 
         for _, env_row in env_data.iterrows():
@@ -182,13 +185,22 @@ def gather_activations_from_grid_at_last_prompt_token(model_name_or_path: str, c
     csv_name = os.path.basename(csv_path)
     output_dir_name = csv_name.replace(".csv", "")
     short_model_name = model_name_or_path.split("/")[-1]
-    output_dir = f"data/activations/{short_model_name}/{output_dir_name}/grid_last_prompt_layer_{layer}"
+    if out_path is None:
+        out_path = "data/activations/"
+    output_dir = out_path + f"{short_model_name}/{output_dir_name}/grid_last_prompt_layer_{layer}"
 
     os.makedirs(output_dir, exist_ok=True)
 
     for cell_type, activations_list in activations_by_type.items():
         if activations_list:  # Only save if we have activations for this type
             activations_tensor = torch.stack(activations_list)
+            # Normalize embeddings without grid coordinates
+            if normalize:
+                scaler_mean = activations_tensor[:-2].mean(dim=0)
+                scaler_std = activations_tensor[:-2].std(dim=0)
+                # Avoid division by zero
+                scaler_std = torch.where(scaler_std > 1e-8, scaler_std, torch.ones_like(scaler_std))
+                activations_tensor[:-2] = (activations_tensor[:-2] - scaler_mean) / scaler_std
             output_path = f"{output_dir}/acts_{cell_type}.pt"
             torch.save(activations_tensor, output_path)
             print(f"Saved {len(activations_list)} {cell_type} activations to {output_path}")
