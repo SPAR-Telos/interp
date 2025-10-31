@@ -17,6 +17,7 @@ dependencies = [
     "toml>=0.10.2",
     "vllm>=0.10.2",
     "scikit-learn>=1.7.2",
+    "matplotlib>=3.10.7",
 ]
 
 [project.optional-dependencies]

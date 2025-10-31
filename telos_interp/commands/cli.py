@@ -5,7 +5,7 @@ from typing import Annotated
 import nnsight
 import torch
 import typer
-from telos_interp import activations, cellwise_activations, data_generation, probing, probing_gpu, steering
+from telos_interp import activations, cellwise_activations, data_generation, logprobs, probing, probing_gpu, steering
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -341,6 +341,53 @@ def steer_interactive(
             typer.echo(f"Response: {response}\n")
         except Exception as e:
             typer.echo(f"Error: {e}\n")
+
+
+@app.command("extract-action-probs", help="Extract action probabilities from logprobs metadata")
+def extract_action_probs(
+    dicts_path: str,
+    out_path: str | None = None,
+    do_plot: Annotated[bool, typer.Option("--plot/--no-plot", help="Plot action probabilities")] = False,
+):
+    # Get filename for dicts_path without extension
+    base_name = os.path.splitext(os.path.basename(dicts_path))[0]
+
+    if out_path is None:
+        out_path = f"data/{base_name}_action_probs"
+
+    # Load either a json or a jsonl file
+    if dicts_path.endswith(".jsonl"):
+        with open(dicts_path) as f:
+            data = [json.loads(line) for line in f]
+    else:
+        with open(dicts_path) as f:
+            data = [json.load(f)]
+
+    out = []
+    for entry in data:
+        action_probs = logprobs.extract_action_probabilities(entry)
+        out.append(action_probs)
+
+    if len(out) == 1:
+        action_probs = out[0]
+        with open(f"{out_path}.json", "w") as f:
+            json.dump(action_probs, f, indent=4)
+        print(f"Action probabilities saved to {out_path}.json")
+        if do_plot:
+            plot_path = f"{out_path}_action_probs_plot.png"
+            logprobs.plot_action_probabilities(action_probs, save_path=plot_path)
+            print(f"Action probabilities plot saved to {plot_path}")
+    else:
+        with open(f"{out_path}.jsonl", "w") as f:
+            for action_probs in out:
+                f.write(json.dumps(action_probs) + "\n")
+        print(f"Action probabilities saved to {out_path}.jsonl")
+        if do_plot:
+            os.makedirs(f"{out_path}_action_probs_plot", exist_ok=True)
+            for i, action_probs in enumerate(out):
+                plot_path = f"{out_path}_action_probs_plot/{i}.png"
+                logprobs.plot_action_probabilities(action_probs, save_path=plot_path)
+            print(f"Action probabilities plots saved to {out_path}_action_probs_plot/")
 
 
 if __name__ == "__main__":
