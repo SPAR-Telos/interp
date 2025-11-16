@@ -328,6 +328,10 @@ def load_action_sequences_from_csv(
 ) -> dict[int, torch.Tensor]:
     """Load action sequences from CSV file.
 
+    Supports two CSV formats:
+    1. Format with 'action_sequence' column containing JSON array: [0, 1, 2, 3, ...]
+    2. Format with 'last_action' column per trajectory step (legacy)
+
     Args:
         csv_path: Path to CSV file with trajectory data
         grid_indices: List of grid indices to load. If None, loads all.
@@ -336,34 +340,74 @@ def load_action_sequences_from_csv(
     Returns:
         Dictionary mapping grid index to action sequence tensor of shape (seq_len,)
     """
+    import json
     import pandas as pd
 
     df = pd.read_csv(csv_path)
 
-    # Group by env_idx and collect action sequences
     action_sequences = {}
-    for env_idx in df["env_idx"].unique():
-        if grid_indices is not None and env_idx not in grid_indices:
-            continue
+    
+    # Check which format we have
+    has_action_sequence_col = "action_sequence" in df.columns
+    has_last_action_col = "last_action" in df.columns
 
-        env_data = df[df["env_idx"] == env_idx].sort_values("trajectory_step")
-        actions = []
+    if has_action_sequence_col:
+        # Format 1: action_sequence column with JSON array
+        for env_idx in df["env_idx"].unique():
+            if grid_indices is not None and env_idx not in grid_indices:
+                continue
 
-        for _, row in env_data.iterrows():
-            last_action = row["last_action"]
-            if pd.notna(last_action) and last_action != "":
-                # Convert action string to integer
+            env_data = df[df["env_idx"] == env_idx]
+            if len(env_data) == 0:
+                continue
+            
+            # Get the first row (since action_sequence is the full sequence)
+            row = env_data.iloc[0]
+            action_sequence_str = row["action_sequence"]
+            
+            if pd.notna(action_sequence_str) and action_sequence_str != "":
                 try:
-                    action_int = int(float(last_action))
-                    actions.append(action_int)
-                except (ValueError, TypeError):
+                    # Parse JSON array
+                    actions = json.loads(action_sequence_str)
+                    # Ensure all actions are integers in range [0, 3]
+                    actions = [int(a) for a in actions if isinstance(a, (int, float)) and 0 <= int(a) <= 3]
+                    
+                    if len(actions) > 0:
+                        action_seq = torch.tensor(actions, dtype=torch.long)
+                        if max_seq_len is not None and len(action_seq) > max_seq_len:
+                            action_seq = action_seq[:max_seq_len]
+                        action_sequences[env_idx] = action_seq
+                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                    print(f"Warning: Failed to parse action_sequence for env_idx {env_idx}: {e}")
                     continue
+    
+    elif has_last_action_col:
+        # Format 2: last_action column per step (legacy format)
+        for env_idx in df["env_idx"].unique():
+            if grid_indices is not None and env_idx not in grid_indices:
+                continue
 
-        if len(actions) > 0:
-            action_seq = torch.tensor(actions, dtype=torch.long)
-            if max_seq_len is not None and len(action_seq) > max_seq_len:
-                action_seq = action_seq[:max_seq_len]
-            action_sequences[env_idx] = action_seq
+            env_data = df[df["env_idx"] == env_idx].sort_values("trajectory_step")
+            actions = []
+
+            for _, row in env_data.iterrows():
+                last_action = row["last_action"]
+                if pd.notna(last_action) and last_action != "":
+                    # Convert action string to integer
+                    try:
+                        action_int = int(float(last_action))
+                        if 0 <= action_int <= 3:  # Validate range
+                            actions.append(action_int)
+                    except (ValueError, TypeError):
+                        continue
+
+            if len(actions) > 0:
+                action_seq = torch.tensor(actions, dtype=torch.long)
+                if max_seq_len is not None and len(action_seq) > max_seq_len:
+                    action_seq = action_seq[:max_seq_len]
+                action_sequences[env_idx] = action_seq
+    else:
+        raise ValueError("CSV must have either 'action_sequence' or 'last_action' column")
 
     return action_sequences
 
