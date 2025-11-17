@@ -100,26 +100,51 @@ def run_model_and_gather_activations_at_token_position(
     prompt_and_response = prompt + response
     input_ids = nnsight_model.tokenizer(prompt_and_response, return_tensors="pt").input_ids
 
-    # For GPT-2/DialoGPT, the model structure is different
-    if hasattr(nnsight_model, "model") and hasattr(nnsight_model.model, "config"):
-        num_layers = nnsight_model.model.config.num_hidden_layers
-    elif hasattr(nnsight_model, "transformer") and hasattr(nnsight_model.transformer, "h"):
+    # Detect model architecture and number of layers
+    # Try multiple common architectures
+    num_layers = None
+    layer_access_path = None
+    
+    if hasattr(nnsight_model, "model"):
+        # Check for LLaMA-style architecture (model.model.layers)
+        if hasattr(nnsight_model.model, "layers"):
+            num_layers = len(nnsight_model.model.layers)
+            layer_access_path = "model.layers"
+        # Check for config-based detection (many architectures)
+        elif hasattr(nnsight_model.model, "config") and hasattr(nnsight_model.model.config, "num_hidden_layers"):
+            num_layers = nnsight_model.model.config.num_hidden_layers
+            # Try to determine layer access path
+            if hasattr(nnsight_model.model, "layers"):
+                layer_access_path = "model.layers"
+            elif hasattr(nnsight_model.model, "transformer") and hasattr(nnsight_model.model.transformer, "h"):
+                layer_access_path = "model.transformer.h"
+    
+    # Check for GPT-2/DialoGPT style (transformer.h)
+    if num_layers is None and hasattr(nnsight_model, "transformer") and hasattr(nnsight_model.transformer, "h"):
         num_layers = len(nnsight_model.transformer.h)
-    else:
-        raise ValueError("Cannot determine number of layers from model structure")
+        layer_access_path = "transformer.h"
+    
+    if num_layers is None or layer_access_path is None:
+        raise ValueError(
+            f"Cannot determine number of layers from model structure. "
+            f"Model attributes: {dir(nnsight_model)}. "
+            f"Please check if the model architecture is supported."
+        )
+    
     all_layer_outputs = []
 
     with torch.no_grad():
         with nnsight_model.trace(input_ids):
             for layer in range(num_layers):
-                # TODO Use nnterp to unify code across models!!!
-                if hasattr(nnsight_model, "model") and hasattr(nnsight_model.model, "layers"):
+                # Access layers based on detected architecture
+                if layer_access_path == "model.layers":
                     full_layer_output = nnsight_model.model.layers[layer].output
-                # For GPT-2/DialoGPT, layers are in transformer.h
-                elif hasattr(nnsight_model, "transformer") and hasattr(nnsight_model.transformer, "h"):
+                elif layer_access_path == "transformer.h":
                     full_layer_output = nnsight_model.transformer.h[layer].output[0]  # Get the tensor, not the tuple
+                elif layer_access_path == "model.transformer.h":
+                    full_layer_output = nnsight_model.model.transformer.h[layer].output[0]
                 else:
-                    raise ValueError("Cannot access model layers")
+                    raise ValueError(f"Unsupported layer access path: {layer_access_path}")
 
                 if token_position == TokenPosition.prompt_last:
                     layer_output = full_layer_output[0, prompt_length - 1, :]  # -1 because indices are 0-based
@@ -470,3 +495,90 @@ def get_activations_for_each_row_in_jsonl(
         results.append({"observation": observation, "activations": activations_dict})
 
     return results
+
+
+def gather_full_prompt_activations_from_csv(
+    model_name_or_path: str,
+    csv_path: str,
+    layers: list[int] | int,
+    unique_envs_only: bool = True,
+) -> str:
+    """Gather activations from the last prompt token in fo_prompt for each grid in a CSV file.
+    
+    This function extracts activations from the last token of the prompt for each grid.
+    It uses only the fo_prompt column and ignores other details like fo_cell_types.
+    Each saved activation tensor has shape (hidden_dim,).
+    
+    Args:
+        model_name_or_path: The name or path of the model to use
+        csv_path: Path to the CSV file containing grid data with 'fo_prompt' column
+        layers: Which layer(s) to extract activations from (can be a single int or list)
+        unique_envs_only: If True, only process one row per unique env_idx (the first one).
+                         If False, process all rows.
+    
+    Returns:
+        Path to the output directory containing saved activations
+    """
+    print(f"Loading grid data from {csv_path}")
+    df = pd.read_csv(csv_path)
+    
+    if "fo_prompt" not in df.columns:
+        raise ValueError(f"CSV file must contain 'fo_prompt' column. Found columns: {df.columns.tolist()}")
+    
+    # Convert layers to list if single int
+    if isinstance(layers, int):
+        layers = [layers]
+    
+    # Filter to unique environments if requested
+    if unique_envs_only:
+        if "env_idx" in df.columns:
+            df = df.groupby("env_idx").first().reset_index()
+            print(f"Processing {len(df)} unique environments")
+        else:
+            print("Warning: 'env_idx' column not found, processing all rows")
+    
+    print(f"Loading model: {model_name_or_path}")
+    model = nnsight.LanguageModel(model_name_or_path, device_map="auto")
+    
+    csv_name = os.path.basename(csv_path)
+    csv_name_no_ext = csv_name.replace(".csv", "")
+    short_model_name = model_name_or_path.split("/")[-1]
+    output_dir = f"data/activations/{short_model_name}/{csv_name_no_ext}/full_prompt_activations"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"Gathering activations for layers {layers} and saving to {output_dir}")
+    print(f"Processing {len(df)} grids...")
+    
+    for idx, row in tqdm(df.iterrows(), desc="Processing grids", total=len(df)):
+        prompt = row["fo_prompt"]
+        
+        # Get activations from the last prompt token
+        empty_response = ""  # Empty response since we're only interested in the input
+        all_layer_activations = run_model_and_gather_activations_at_token_position(
+            model, prompt, empty_response, TokenPosition.prompt_last
+        )  # (num_layers, hidden_dim)
+        
+        # Determine grid identifier
+        if "env_idx" in row:
+            grid_id = f"env_{row['env_idx']}"
+            if "trajectory_step" in row and pd.notna(row["trajectory_step"]):
+                grid_id += f"_step_{int(row['trajectory_step'])}"
+        else:
+            grid_id = f"grid_{idx}"
+        
+        # Save activations for each requested layer
+        for layer in layers:
+            if layer >= all_layer_activations.shape[0]:
+                print(f"Warning: Layer {layer} not available. Model has {all_layer_activations.shape[0]} layers. Skipping.")
+                continue
+            
+            layer_activations = all_layer_activations[layer]  # (hidden_dim,)
+            
+            row_dir = os.path.join(output_dir, grid_id)
+            activations_dir = os.path.join(row_dir, f"layer_{layer}")
+            activations_path = os.path.join(activations_dir, "activations.pt")
+            os.makedirs(activations_dir, exist_ok=True)
+            torch.save(layer_activations, activations_path)
+    
+    print(f"Activations saved to {output_dir}")
+    return output_dir

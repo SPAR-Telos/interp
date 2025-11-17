@@ -121,6 +121,35 @@ def gather_full_activations_from_jsonl(
     typer.echo(f"HF path: {hf_path}")
 
 
+@app.command("gather-full-prompt-acts-csv", help="Gather activations for all tokens in fo_prompt from a CSV file")
+def gather_full_prompt_activations_from_csv(
+    model_name_or_path: str,
+    csv_path: str,
+    layers: Annotated[str, typer.Option(help="Comma-separated list of layer numbers, or single layer number")],
+    unique_envs_only: Annotated[bool, typer.Option(help="Only process one row per unique env_idx")] = True,
+):
+    """Gather activations for all tokens in fo_prompt for each grid in a CSV file.
+    
+    This extracts activations for all tokens in the prompt (up to the last token of the prompt)
+    for each grid. It uses only the fo_prompt column and ignores other details like fo_cell_types.
+    """
+    # Parse layers - can be single int or comma-separated list
+    try:
+        if "," in layers:
+            layers_list = parse_list_of_integers(layers)
+        else:
+            layers_list = int(layers)
+    except ValueError:
+        typer.echo(f"Error: Invalid layers format '{layers}'. Use a single integer or comma-separated list.")
+        raise typer.Exit(1)
+    
+    results_path = activations.gather_full_prompt_activations_from_csv(
+        model_name_or_path, csv_path, layers_list, unique_envs_only
+    )
+
+    typer.echo(f"Full prompt activations saved to {results_path}")
+
+
 @app.command("train-multiclass-probe", help="Train a multi-class probing classifier on grid cell activations")
 def train_multiclass_probe(
     activations_dir: Annotated[

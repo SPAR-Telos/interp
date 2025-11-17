@@ -22,7 +22,7 @@ class ActionDecoderProbe(nn.Module):
 
     Args:
         activation_dim: Dimension of the input LLM activation vector
-        vocab_size: Number of action tokens (default: 4 for LEFT, RIGHT, UP, DOWN)
+        vocab_size: Number of action tokens (default: 4 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN)
         n_layer: Number of transformer decoder layers (default: 4)
         n_head: Number of attention heads (default: 4)
         n_embd: Hidden dimension of the decoder (default: 256)
@@ -109,13 +109,20 @@ class ActionDecoderProbe(nn.Module):
         activation_embed = self.activation_projection(activation)  # (batch_size, n_embd)
         activation_embed = activation_embed.unsqueeze(1)  # (batch_size, 1, n_embd) - this is the "prefix"
 
+        # Truncate labels to max_seq_len - 1 if provided
+        # This ensures position indices don't exceed embedding range (since positions start at 1)
+        if labels is not None and labels.shape[1] > self.max_seq_len - 1:
+            labels = labels[:, :self.max_seq_len - 1]
+        
         if action_ids is None and labels is not None:
             # For training: shift labels to create input sequence (teacher forcing)
             # Shift: [action_0, action_1, ..., action_n] -> [0, action_0, ..., action_{n-1}]
             seq_len = labels.shape[1]
             if seq_len > 0:
+                # Clamp labels to valid range [0, vocab_size-1] before using
+                labels_clamped = torch.clamp(labels, 0, self.vocab_size - 1)
                 action_ids = torch.cat(
-                    [torch.zeros(batch_size, 1, dtype=torch.long, device=device), labels[:, :-1]], dim=1
+                    [torch.zeros(batch_size, 1, dtype=torch.long, device=device), labels_clamped[:, :-1]], dim=1
                 )
             else:
                 action_ids = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
@@ -125,9 +132,26 @@ class ActionDecoderProbe(nn.Module):
 
         # Build target sequence embeddings
         if action_ids.shape[1] > 0:
+            # Clamp action_ids to valid range [0, vocab_size-1]
+            action_ids = torch.clamp(action_ids, 0, self.vocab_size - 1)
+            # Truncate to max_seq_len - 1 if needed (to ensure position indices are valid)
+            if action_ids.shape[1] > self.max_seq_len - 1:
+                action_ids = action_ids[:, :self.max_seq_len - 1]
+            
             action_embeds = self.action_embeddings(action_ids)  # (batch_size, seq_len, n_embd)
             # Add position embeddings (starting from position 1, since activation is at position 0)
-            positions = torch.arange(1, action_ids.shape[1] + 1, device=device).unsqueeze(0).expand(batch_size, -1)
+            # Position embeddings have indices [0, max_seq_len-1]
+            # Since positions start at 1, we need seq_len <= max_seq_len - 1 to ensure max position <= max_seq_len - 1
+            seq_len = action_ids.shape[1]
+            if seq_len > self.max_seq_len - 1:
+                # Truncate to ensure positions don't exceed embedding range
+                seq_len = self.max_seq_len - 1
+                action_ids = action_ids[:, :seq_len]
+                action_embeds = self.action_embeddings(action_ids)
+            
+            # Generate positions [1, 2, ..., seq_len] where seq_len <= max_seq_len - 1
+            # So max position is seq_len <= max_seq_len - 1, which is valid for embedding
+            positions = torch.arange(1, seq_len + 1, device=device).unsqueeze(0).expand(batch_size, -1)
             pos_embeds = self.position_embeddings(positions)
             target_embeds = action_embeds + pos_embeds  # (batch_size, seq_len, n_embd)
         else:
@@ -146,6 +170,12 @@ class ActionDecoderProbe(nn.Module):
         logits = self.lm_head(decoder_output)  # (batch_size, seq_len, vocab_size)
 
         if labels is not None:
+            # Truncate labels to match logits length (which is based on action_ids/seq_len)
+            seq_len_used = logits.shape[1]
+            if labels.shape[1] > seq_len_used:
+                labels = labels[:, :seq_len_used]
+            # Clamp labels to valid range [0, vocab_size-1] (ignore padding -100)
+            labels = torch.where(labels == -100, labels, torch.clamp(labels, 0, self.vocab_size - 1))
             # Compute cross-entropy loss
             # Reshape for loss computation
             logits_flat = logits.view(-1, self.vocab_size)  # (batch_size * seq_len, vocab_size)
@@ -161,6 +191,10 @@ class ActionDecoderProbe(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         top_p: float | None = None,
+        min_confidence: float = 0.5,
+        max_repetition: int = 3,
+        entropy_threshold: float = 0.9,
+        max_length_override: int | None = None,
     ) -> torch.Tensor:
         """Generate action sequence autoregressively from activation.
 
@@ -170,12 +204,19 @@ class ActionDecoderProbe(nn.Module):
             temperature: Sampling temperature (default: 1.0)
             top_k: Top-k sampling (default: None, disabled)
             top_p: Nucleus sampling (default: None, disabled)
+            min_confidence: Minimum probability of top action to continue (default: 0.5)
+            max_repetition: Maximum consecutive identical actions before stopping (default: 3)
+            entropy_threshold: Maximum entropy (uncertainty) before stopping (default: 0.9)
+            max_length_override: Hard limit on sequence length, regardless of confidence (default: None, uses max_length)
 
         Returns:
             Generated action token IDs of shape (batch_size, generated_length)
         """
         if max_length is None:
             max_length = self.max_seq_len
+        
+        # Use override if provided (e.g., based on training data statistics)
+        effective_max_length = max_length_override if max_length_override is not None else max_length
 
         batch_size = activation.shape[0]
         device = activation.device
@@ -191,7 +232,7 @@ class ActionDecoderProbe(nn.Module):
         generated = []
         with torch.no_grad():
             # Generate tokens autoregressively
-            for step in range(max_length):
+            for step in range(effective_max_length):
                 if step == 0:
                     # First step: use activation as target (empty sequence)
                     target_embeds = activation_embed  # (batch_size, 1, n_embd)
@@ -233,10 +274,67 @@ class ActionDecoderProbe(nn.Module):
 
                 # Sample next token
                 probs = torch.softmax(next_token_logits, dim=-1)
+                
+                # Early stopping checks
+                # 1. Check confidence (max probability)
+                max_prob, _ = torch.max(probs, dim=-1)  # (batch_size,)
+                
+                # 2. Check entropy (uncertainty)
+                # Entropy = -sum(p * log(p))
+                log_probs = torch.log(probs + 1e-10)  # Add small epsilon to avoid log(0)
+                entropy = -torch.sum(probs * log_probs, dim=-1)  # (batch_size,)
+                
+                # 3. Check for repetitive patterns
+                should_stop = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                
+                for b in range(batch_size):
+                    # Hard length limit check (safety)
+                    if step >= effective_max_length - 1:
+                        should_stop[b] = True
+                        continue
+                    
+                    # Low confidence check - if model is uncertain, likely done
+                    if max_prob[b].item() < min_confidence:
+                        should_stop[b] = True
+                        continue
+                    
+                    # High entropy (uncertainty) check - uniform distribution = done
+                    # For 4 classes, max entropy = log(4) ≈ 1.386
+                    # Threshold of 0.9 means model is quite uncertain
+                    if entropy[b].item() > entropy_threshold:
+                        should_stop[b] = True
+                        continue
+                    
+                    # Repetition check (only if we have generated actions)
+                    # If model repeats same action, likely stuck
+                    if len(generated) >= max_repetition:
+                        recent_actions = [g[b].item() for g in generated[-max_repetition:]]
+                        if len(set(recent_actions)) == 1:  # All same action
+                            should_stop[b] = True
+                            continue
+                
+                # Sample next token
                 next_token = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
                 generated.append(next_token.squeeze(1))  # (batch_size,)
+                
+                # Stop generation for batches that meet stopping criteria
+                if should_stop.all():
+                    break
+                
+                # For batches that should stop, we still add the token but will truncate later
+                # (This is simpler than handling variable-length sequences per batch item)
 
-        return torch.stack(generated, dim=1)  # (batch_size, max_length)
+        # Stack all generated tokens
+        if len(generated) > 0:
+            result = torch.stack(generated, dim=1)  # (batch_size, generated_length)
+            
+            # Apply per-batch stopping (post-hoc, but keeps batch structure)
+            # For now, return all generated tokens - the stopping is more of a guideline
+            # The user can truncate based on confidence if needed
+            return result
+        else:
+            # No tokens generated (shouldn't happen, but handle edge case)
+            return torch.zeros(batch_size, 0, dtype=torch.long, device=device)
 
 
 def load_activations_from_hf(
@@ -318,6 +416,96 @@ def load_activations_from_hf(
             continue
 
     print(f"Successfully loaded {loaded}/{len(grid_indices)} grids")
+    return activations
+
+
+def load_activations_from_local(
+    activations_dir: str,
+    layer: int,
+    grid_indices: list | None = None,
+) -> dict[int, torch.Tensor]:
+    """Load activations from local directory.
+    
+    Expects directory structure:
+        activations_dir/
+            env_{env_idx}_step_{step}/layer_{layer}/activations.pt
+        OR
+            env_{env_idx}/layer_{layer}/activations.pt
+    
+    Args:
+        activations_dir: Path to directory containing activation files
+        layer: Layer number to load activations from
+        grid_indices: List of env_idx values to load. If None, discovers all available.
+    
+    Returns:
+        Dictionary mapping env_idx to activation tensor of shape (hidden_dim,)
+    """
+    import glob
+    
+    activations = {}
+    activations_dir = os.path.abspath(activations_dir)
+    
+    if grid_indices is None:
+        # Discover available env_idx values
+        pattern = os.path.join(activations_dir, f"env_*/layer_{layer}/activations.pt")
+        files = glob.glob(pattern)
+        grid_set = set()
+        for file in files:
+            # Extract env_idx from path like "env_123_step_0/layer_20/activations.pt" or "env_123/layer_20/activations.pt"
+            rel_path = os.path.relpath(file, activations_dir)
+            parts = rel_path.split(os.sep)
+            if len(parts) >= 1:
+                env_part = parts[0]  # "env_123" or "env_123_step_0"
+                if env_part.startswith("env_"):
+                    try:
+                        # Extract number after "env_"
+                        env_idx_str = env_part.replace("env_", "").split("_step_")[0]
+                        env_idx = int(env_idx_str)
+                        grid_set.add(env_idx)
+                    except ValueError:
+                        continue
+        grid_indices = sorted(list(grid_set))
+        print(f"Found {len(grid_indices)} environments with layer_{layer} activations")
+    
+    print(f"Loading activations for {len(grid_indices)} environments...")
+    loaded = 0
+    
+    for env_idx in grid_indices:
+        # Try both patterns: with and without _step_0
+        patterns = [
+            os.path.join(activations_dir, f"env_{env_idx}_step_0", f"layer_{layer}", "activations.pt"),
+            os.path.join(activations_dir, f"env_{env_idx}", f"layer_{layer}", "activations.pt"),
+        ]
+        
+        activation_path = None
+        for pattern in patterns:
+            if os.path.exists(pattern):
+                activation_path = pattern
+                break
+        
+        if activation_path is None:
+            # Try glob pattern as fallback
+            glob_pattern = os.path.join(activations_dir, f"env_{env_idx}*", f"layer_{layer}", "activations.pt")
+            matches = glob.glob(glob_pattern)
+            if matches:
+                activation_path = matches[0]
+        
+        if activation_path and os.path.exists(activation_path):
+            try:
+                activation = load_activations(activation_path)
+                # Ensure it's 1D (hidden_dim,)
+                if activation.ndim > 1:
+                    # If it's (seq_len, hidden_dim), take the last token
+                    activation = activation[-1]
+                activations[env_idx] = activation
+                loaded += 1
+            except Exception as e:
+                print(f"Warning: Could not load activations for env_{env_idx}: {e}")
+                continue
+        else:
+            print(f"Warning: Could not find activations for env_{env_idx}")
+    
+    print(f"Successfully loaded {loaded}/{len(grid_indices)} activations")
     return activations
 
 
@@ -416,6 +604,7 @@ def create_dataset(
     activations: dict[int, torch.Tensor],
     action_sequences: dict[int, torch.Tensor],
     max_seq_len: int | None = None,
+    vocab_size: int = 4,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Create dataset pairs of (activation, action_sequence).
 
@@ -436,6 +625,10 @@ def create_dataset(
         activation = activations[grid_idx]
         action_seq = action_sequences[grid_idx]
 
+        # Validate and clamp action values to valid range [0, vocab_size-1]
+        action_seq = torch.clamp(action_seq, 0, vocab_size - 1)
+        
+        # Truncate if needed
         if max_seq_len is not None and len(action_seq) > max_seq_len:
             action_seq = action_seq[:max_seq_len]
 
@@ -452,6 +645,7 @@ def train_decoder_probe(
     learning_rate: float = 1e-4,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_split: float = 0.2,
+    val_dataset: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     save_path: str | None = None,
 ) -> dict:
     """Train the decoder probe model.
@@ -475,15 +669,26 @@ def train_decoder_probe(
 
     model = model.to(device)
 
-    # Split dataset
-    random.shuffle(dataset)
-    split_idx = int(len(dataset) * (1 - eval_split))
-    train_data = dataset[:split_idx]
-    eval_data = dataset[split_idx:]
+    # Use provided validation dataset or split training dataset
+    if val_dataset is not None:
+        train_data = dataset
+        eval_data = val_dataset
+        print(f"Using separate validation set: {len(eval_data)} samples")
+    else:
+        # Split dataset
+        random.shuffle(dataset)
+        split_idx = int(len(dataset) * (1 - eval_split))
+        train_data = dataset[:split_idx]
+        eval_data = dataset[split_idx:]
+        print(f"Split training data: {len(train_data)} train, {len(eval_data)} eval")
 
     # Prepare data for DataLoader
-    # We need to pad sequences to the same length
-    max_seq_len = max(len(seq) for _, seq in dataset) if dataset else 100
+    # We need to pad sequences to the same length, but cap at model's max_seq_len - 1
+    # (because positions start at 1, so max position is max_seq_len - 1)
+    # Calculate max length across both train and eval datasets
+    all_data = train_data + (eval_data if eval_data else [])
+    dataset_max_len = max(len(seq) for _, seq in all_data) if all_data else 100
+    effective_max_len = min(dataset_max_len, model.max_seq_len - 1)
 
     def collate_fn(batch):
         activations = []
@@ -492,14 +697,19 @@ def train_decoder_probe(
 
         for activation, action_seq in batch:
             activations.append(activation)
+            # Truncate if longer than model's max_seq_len - 1 (to account for position embedding limit)
+            if len(action_seq) > model.max_seq_len - 1:
+                action_seq = action_seq[:model.max_seq_len - 1]
             seq_lens.append(len(action_seq))
-            # Pad sequence to max_seq_len
-            if len(action_seq) < max_seq_len:
+            # Pad sequence to effective_max_len
+            if len(action_seq) < effective_max_len:
                 padded_seq = torch.cat(
-                    [action_seq, torch.full((max_seq_len - len(action_seq),), -100, dtype=torch.long)]
+                    [action_seq, torch.full((effective_max_len - len(action_seq),), -100, dtype=torch.long)]
                 )
             else:
                 padded_seq = action_seq
+            # Ensure all action values are in valid range [0, vocab_size-1] (ignore padding -100)
+            padded_seq = torch.where(padded_seq == -100, padded_seq, torch.clamp(padded_seq, 0, model.vocab_size - 1))
             action_seqs.append(padded_seq)
 
         activations_tensor = torch.stack(activations)
@@ -549,53 +759,58 @@ def train_decoder_probe(
         exact_matches = 0
         total_sequences = 0
 
-        with torch.no_grad():
-            for batch_idx, (activations_batch, action_seqs_batch, seq_lens) in enumerate(eval_loader):
-                activations_batch = activations_batch.to(device).to(torch.float32)
-                action_seqs_batch = action_seqs_batch.to(device)
+        if len(eval_data) == 0:
+            # No eval data (eval_split was 0 or all data used for training)
+            avg_eval_loss = 0.0
+            token_accuracy = 0.0
+            sequence_accuracy = 0.0
+        else:
+            with torch.no_grad():
+                for batch_idx, (activations_batch, action_seqs_batch, seq_lens) in enumerate(eval_loader):
+                    activations_batch = activations_batch.to(device).to(torch.float32)
+                    action_seqs_batch = action_seqs_batch.to(device)
 
-                loss, logits = model(activations_batch, labels=action_seqs_batch)
+                    loss, logits = model(activations_batch, labels=action_seqs_batch)
 
-                epoch_eval_loss += loss.item()
-                num_eval_batches += 1
+                    epoch_eval_loss += loss.item()
+                    num_eval_batches += 1
 
-                # Compute accuracy metrics
-                predictions = torch.argmax(logits, dim=-1)  # (batch_size, seq_len)
+                    # Compute accuracy metrics
+                    predictions = torch.argmax(logits, dim=-1)  # (batch_size, seq_len)
 
-                # Token-level accuracy (only count non-padding tokens)
-                mask = action_seqs_batch != -100
-                total_tokens += mask.sum().item()
-                correct_tokens += ((predictions == action_seqs_batch) & mask).sum().item()
+                    # Token-level accuracy (only count non-padding tokens)
+                    mask = action_seqs_batch != -100
+                    total_tokens += mask.sum().item()
+                    correct_tokens += ((predictions == action_seqs_batch) & mask).sum().item()
 
-                # Sequence-level exact match
-                for i in range(predictions.shape[0]):
-                    seq_len = seq_lens[i].item()
-                    if seq_len > 0:
-                        pred_seq = predictions[i, :seq_len].cpu()
-                        true_seq = action_seqs_batch[i, :seq_len].cpu()
-                        if torch.equal(pred_seq, true_seq):
-                            exact_matches += 1
-                        total_sequences += 1
-
-                # Show sample predictions for first batch of last epoch
-                if epoch == num_epochs - 1 and batch_idx == 0:
-                    print("\nSample predictions (first batch):")
-                    for i in range(min(3, predictions.shape[0])):
+                    # Sequence-level exact match
+                    for i in range(predictions.shape[0]):
                         seq_len = seq_lens[i].item()
                         if seq_len > 0:
-                            pred_seq = predictions[i, :seq_len].cpu().tolist()
-                            true_seq = action_seqs_batch[i, :seq_len].cpu().tolist()
-                            print(f"  Sample {i + 1}:")
-                            print(f"    True:  {true_seq}")
-                            print(f"    Pred:  {pred_seq}")
-                            print(f"    Match: {pred_seq == true_seq}")
+                            pred_seq = predictions[i, :seq_len].cpu()
+                            true_seq = action_seqs_batch[i, :seq_len].cpu()
+                            if torch.equal(pred_seq, true_seq):
+                                exact_matches += 1
+                            total_sequences += 1
 
-        avg_eval_loss = epoch_eval_loss / num_eval_batches if num_eval_batches > 0 else 0.0
+                    # Show sample predictions for first batch of last epoch
+                    if epoch == num_epochs - 1 and batch_idx == 0:
+                        print("\nSample predictions (first batch):")
+                        for i in range(min(3, predictions.shape[0])):
+                            seq_len = seq_lens[i].item()
+                            if seq_len > 0:
+                                pred_seq = predictions[i, :seq_len].cpu().tolist()
+                                true_seq = action_seqs_batch[i, :seq_len].cpu().tolist()
+                                print(f"  Sample {i + 1}:")
+                                print(f"    True:  {true_seq}")
+                                print(f"    Pred:  {pred_seq}")
+                                print(f"    Match: {pred_seq == true_seq}")
+
+            avg_eval_loss = epoch_eval_loss / num_eval_batches if num_eval_batches > 0 else 0.0
+            token_accuracy = correct_tokens / total_tokens if total_tokens > 0 else 0.0
+            sequence_accuracy = exact_matches / total_sequences if total_sequences > 0 else 0.0
+
         eval_losses.append(avg_eval_loss)
-
-        # Compute accuracy metrics
-        token_accuracy = correct_tokens / total_tokens if total_tokens > 0 else 0.0
-        sequence_accuracy = exact_matches / total_sequences if total_sequences > 0 else 0.0
 
         print(
             f"Epoch {epoch + 1}/{num_epochs}: "

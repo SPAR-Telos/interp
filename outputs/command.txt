@@ -1,0 +1,7 @@
+Decoder training:
+python scripts/train_decoder_probe.py     --activations-dir "data/activations/gpt-oss-20b/7by7traingrids/full_prompt_activations"     --train-csv "outputs/7by7traingrids.csv"     --val-csv "outputs/7by7valgrids.csv"     --test-csv "outputs/7by7testgrids.csv"     --layer 20     --num-epochs 20     --batch-size 32     --learning-rate 1e-4     --max-seq-len 100     --save-path "models/decoder_probe_layer_20.pt"
+
+Decoder testing: 
+python scripts/test_decoder_probe.py     --model-path models/decoder_probe_layer_20.pt     --activation-path data/activations/gpt-oss-20b/7by7testgrids/full_prompt_activations/env_2_step_0/layer_20/activations.pt     --max-length 100
+
+
