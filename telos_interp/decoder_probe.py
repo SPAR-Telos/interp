@@ -13,6 +13,9 @@ from torch import nn
 
 from telos_interp.probing import load_activations
 
+# EOS token ID (end-of-sequence marker)
+EOS_TOKEN_ID = 4
+
 
 class ActionDecoderProbe(nn.Module):
     """Small transformer decoder that predicts action sequences from LLM activations.
@@ -22,29 +25,33 @@ class ActionDecoderProbe(nn.Module):
 
     Args:
         activation_dim: Dimension of the input LLM activation vector
-        vocab_size: Number of action tokens (default: 4 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN)
+        vocab_size: Number of action tokens (default: 5 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=EOS)
         n_layer: Number of transformer decoder layers (default: 4)
         n_head: Number of attention heads (default: 4)
         n_embd: Hidden dimension of the decoder (default: 256)
         max_seq_len: Maximum sequence length for action predictions (default: 100)
         dropout: Dropout rate (default: 0.1)
+        eos_loss_weight_threshold: Threshold for position-weighted EOS loss (default: 3.0).
+            EOS loss weight = min(1.0, (position + 1) / threshold). Higher values allow earlier EOS.
     """
 
     def __init__(
         self,
         activation_dim: int,
-        vocab_size: int = 4,
+        vocab_size: int = 5,
         n_layer: int = 4,
         n_head: int = 4,
         n_embd: int = 256,
         max_seq_len: int = 100,
         dropout: float = 0.1,
+        eos_loss_weight_threshold: float = 3.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.activation_dim = activation_dim
         self.n_embd = n_embd
+        self.eos_loss_weight_threshold = eos_loss_weight_threshold
 
         # Project activation to decoder embedding dimension
         self.activation_projection = nn.Linear(activation_dim, n_embd)
@@ -176,11 +183,38 @@ class ActionDecoderProbe(nn.Module):
                 labels = labels[:, :seq_len_used]
             # Clamp labels to valid range [0, vocab_size-1] (ignore padding -100)
             labels = torch.where(labels == -100, labels, torch.clamp(labels, 0, self.vocab_size - 1))
-            # Compute cross-entropy loss
-            # Reshape for loss computation
+            
+            # Compute per-token loss for position-weighted EOS loss
             logits_flat = logits.view(-1, self.vocab_size)  # (batch_size * seq_len, vocab_size)
             labels_flat = labels.view(-1)  # (batch_size * seq_len)
-            loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+            
+            # Compute per-token loss (reduction='none')
+            per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none')
+            
+            # Apply position-weighted loss for EOS token to prevent mode collapse
+            # Reshape to (batch_size, seq_len) for position indexing
+            batch_size = labels.shape[0]
+            per_token_loss_2d = per_token_loss.view(batch_size, seq_len_used)
+            labels_2d = labels_flat.view(batch_size, seq_len_used)
+            
+            # Create position indices: [0, 1, 2, ..., seq_len-1]
+            position_indices = torch.arange(seq_len_used, device=labels.device, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
+            
+            # Compute EOS loss weights: weight = min(1.0, (position + 1) / threshold)
+            # This gives lower weight to early EOS predictions
+            eos_weights = torch.clamp((position_indices + 1.0) / self.eos_loss_weight_threshold, max=1.0)
+            
+            # Apply weights: use eos_weights for EOS tokens, 1.0 for non-EOS tokens
+            is_eos = (labels_2d == EOS_TOKEN_ID) & (labels_2d != -100)
+            loss_weights = torch.where(is_eos, eos_weights, torch.ones_like(eos_weights))
+            
+            # Apply weights to per-token loss
+            weighted_loss = per_token_loss_2d * loss_weights
+            
+            # Mask out padding tokens (-100) and compute mean
+            valid_mask = (labels_2d != -100)
+            loss = weighted_loss[valid_mask].sum() / valid_mask.sum().clamp(min=1)
+            
             return loss, logits
         return logits
 
@@ -191,10 +225,11 @@ class ActionDecoderProbe(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         top_p: float | None = None,
-        min_confidence: float = 0.5,
-        max_repetition: int = 3,
-        entropy_threshold: float = 0.9,
+        min_confidence: float = 0.0,
+        max_repetition: int = 10,
+        entropy_threshold: float = 2.0,
         max_length_override: int | None = None,
+        disable_heuristic_stopping: bool = False,
     ) -> torch.Tensor:
         """Generate action sequence autoregressively from activation.
 
@@ -274,74 +309,105 @@ class ActionDecoderProbe(nn.Module):
 
                 # Sample next token
                 probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
+                next_token = next_token.squeeze(1)  # (batch_size,)
+                generated.append(next_token)
                 
-                # Early stopping checks
-                # 1. Check confidence (max probability)
-                max_prob, _ = torch.max(probs, dim=-1)  # (batch_size,)
+                # Check if EOS token was sampled - EOS takes priority over heuristic stopping
+                eos_predicted = (next_token == EOS_TOKEN_ID)
+                if eos_predicted.any():
+                    # If all sequences predicted EOS, stop completely
+                    if eos_predicted.all():
+                        break
+                    # For mixed batches, continue but EOS will be filtered out later
+                    # Continue generation for non-EOS sequences only
                 
-                # 2. Check entropy (uncertainty)
-                # Entropy = -sum(p * log(p))
-                log_probs = torch.log(probs + 1e-10)  # Add small epsilon to avoid log(0)
-                entropy = -torch.sum(probs * log_probs, dim=-1)  # (batch_size,)
-                
-                # 3. Check for repetitive patterns
-                should_stop = torch.zeros(batch_size, dtype=torch.bool, device=device)
-                
-                for b in range(batch_size):
-                    # Hard length limit check (safety)
-                    if step >= effective_max_length - 1:
-                        should_stop[b] = True
-                        continue
+                # Heuristic stopping (only if not disabled)
+                if not disable_heuristic_stopping:
+                    # 1. Check confidence (max probability)
+                    max_prob, _ = torch.max(probs, dim=-1)  # (batch_size,)
                     
-                    # Low confidence check - if model is uncertain, likely done
-                    if max_prob[b].item() < min_confidence:
-                        should_stop[b] = True
-                        continue
+                    # 2. Check entropy (uncertainty)
+                    # Entropy = -sum(p * log(p))
+                    log_probs = torch.log(probs + 1e-10)  # Add small epsilon to avoid log(0)
+                    entropy = -torch.sum(probs * log_probs, dim=-1)  # (batch_size,)
                     
-                    # High entropy (uncertainty) check - uniform distribution = done
-                    # For 4 classes, max entropy = log(4) ≈ 1.386
-                    # Threshold of 0.9 means model is quite uncertain
-                    if entropy[b].item() > entropy_threshold:
-                        should_stop[b] = True
-                        continue
+                    # 3. Check for repetitive patterns
+                    should_stop = torch.zeros(batch_size, dtype=torch.bool, device=device)
                     
-                    # Repetition check (only if we have generated actions)
-                    # If model repeats same action, likely stuck
-                    if len(generated) >= max_repetition:
-                        recent_actions = [g[b].item() for g in generated[-max_repetition:]]
-                        if len(set(recent_actions)) == 1:  # All same action
+                    for b in range(batch_size):
+                        # Skip if this sequence already predicted EOS
+                        if eos_predicted[b]:
+                            continue
+                        
+                        # Hard length limit check (safety)
+                        if step >= effective_max_length - 1:
                             should_stop[b] = True
                             continue
-                
-                # Sample next token
-                next_token = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
-                generated.append(next_token.squeeze(1))  # (batch_size,)
-                
-                # Stop generation for batches that meet stopping criteria
-                if should_stop.all():
-                    break
-                
-                # For batches that should stop, we still add the token but will truncate later
-                # (This is simpler than handling variable-length sequences per batch item)
+                        
+                        # Low confidence check - if model is uncertain, likely done
+                        if min_confidence > 0 and max_prob[b].item() < min_confidence:
+                            should_stop[b] = True
+                            continue
+                        
+                        # High entropy (uncertainty) check - uniform distribution = done
+                        # For vocab_size=5, max entropy = log(5) ≈ 1.609
+                        if entropy[b].item() > entropy_threshold:
+                            should_stop[b] = True
+                            continue
+                        
+                        # Repetition check (only if we have generated actions)
+                        # If model repeats same action, likely stuck
+                        if len(generated) >= max_repetition:
+                            recent_actions = [g[b].item() for g in generated[-max_repetition:]]
+                            if len(set(recent_actions)) == 1:  # All same action
+                                should_stop[b] = True
+                                continue
+                    
+                    # Stop generation for batches that meet stopping criteria
+                    if should_stop.all():
+                        break
 
         # Stack all generated tokens
         if len(generated) > 0:
             result = torch.stack(generated, dim=1)  # (batch_size, generated_length)
             
-            # Apply per-batch stopping (post-hoc, but keeps batch structure)
-            # For now, return all generated tokens - the stopping is more of a guideline
-            # The user can truncate based on confidence if needed
-            return result
+            # Remove EOS tokens from output (keep sequences up to but not including EOS)
+            # Process each sequence in the batch
+            filtered_results = []
+            for b in range(batch_size):
+                seq = result[b]  # (generated_length,)
+                # Find first EOS token
+                eos_indices = (seq == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
+                if len(eos_indices) > 0:
+                    # Truncate at first EOS
+                    seq = seq[:eos_indices[0]]
+                filtered_results.append(seq)
+            
+            # Pad to same length for batching (or return as list if lengths vary)
+            # For simplicity, find max length and pad
+            max_len = max(len(seq) for seq in filtered_results) if filtered_results else 0
+            if max_len > 0:
+                padded_results = []
+                for seq in filtered_results:
+                    if len(seq) < max_len:
+                        # Pad with -100 (will be ignored in evaluation)
+                        padding = torch.full((max_len - len(seq),), -100, dtype=torch.long, device=device)
+                        seq = torch.cat([seq, padding])
+                    padded_results.append(seq)
+                return torch.stack(padded_results, dim=0)  # (batch_size, max_len)
+            else:
+                return torch.zeros(batch_size, 0, dtype=torch.long, device=device)
         else:
             # No tokens generated (shouldn't happen, but handle edge case)
             return torch.zeros(batch_size, 0, dtype=torch.long, device=device)
 
 
 def load_activations_from_hf(
-    repo_id: str = "project-telos/interp",
-    path_in_repo: str = "first_six_hundred_grids",
+    repo_id: str = "project-telos/decoder",
+    path_in_repo: str = "activations/7by7traingrids/full_prompt_activations",
     grid_indices: list | None = None,
-    layer: int = 12,
+    layer: int = 20,
     cache_dir: str | None = None,
 ) -> dict[int, torch.Tensor]:
     """Load activations from Hugging Face repository.
@@ -366,36 +432,39 @@ def load_activations_from_hf(
         try:
             api = HfApi()
             repo_files = api.list_repo_files(repo_id=repo_id, repo_type="model")
-            # Filter for files matching the pattern: path_in_repo/grid_N/layer_X/activations.pt
+            # Filter for files matching the pattern: path_in_repo/env_N_step_0/layer_X/activations.pt
             grid_set = set()
             target_pattern = f"/layer_{layer}/activations.pt"
             for file in repo_files:
-                if file.startswith(f"{path_in_repo}/grid_") and file.endswith(target_pattern):
-                    # Extract grid index from path like "first_six_hundred_grids/grid_123/layer_20/activations.pt"
+                if file.startswith(f"{path_in_repo}/env_") and file.endswith(target_pattern):
+                    # Extract env index from path like "activations/7by7traingrids/full_prompt_activations/env_123_step_0/layer_20/activations.pt"
                     parts = file.split("/")
-                    if len(parts) >= 2:
-                        grid_part = parts[1]  # "grid_123"
-                        if grid_part.startswith("grid_"):
+                    # Find the part that starts with "env_"
+                    for part in parts:
+                        if part.startswith("env_"):
                             try:
-                                grid_idx = int(grid_part.replace("grid_", ""))
-                                grid_set.add(grid_idx)
+                                # Extract number from "env_123_step_0" or "env_123"
+                                env_idx_str = part.replace("env_", "").split("_step_")[0]
+                                env_idx = int(env_idx_str)
+                                grid_set.add(env_idx)
                             except ValueError:
                                 continue
+                            break
             grid_indices = sorted(list(grid_set))
             print(
-                f"Found {len(grid_indices)} grids with layer_{layer} activations: {grid_indices[:20]}{'...' if len(grid_indices) > 20 else ''}"
+                f"Found {len(grid_indices)} environments with layer_{layer} activations: {grid_indices[:20]}{'...' if len(grid_indices) > 20 else ''}"
             )
         except Exception as e:
             print(f"Warning: Could not list repository files: {e}")
-            print("Falling back to trying grids 0-599...")
-            grid_indices = list(range(600))
+            print("Falling back to trying env indices 1-2400...")
+            grid_indices = list(range(1, 2401))
 
-    print(f"Loading activations for {len(grid_indices)} grids...")
+    print(f"Loading activations for {len(grid_indices)} environments...")
     loaded = 0
-    for grid_idx in grid_indices:
+    for env_idx in grid_indices:
         try:
-            # Construct filename: first_six_hundred_grids/grid_N/layer_X/activations.pt
-            filename = f"{path_in_repo}/grid_{grid_idx}/layer_{layer}/activations.pt"
+            # Construct filename: activations/7by7traingrids/full_prompt_activations/env_N_step_0/layer_X/activations.pt
+            filename = f"{path_in_repo}/env_{env_idx}_step_0/layer_{layer}/activations.pt"
             activation_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
@@ -407,15 +476,15 @@ def load_activations_from_hf(
             if activation.ndim > 1:
                 # If it's (seq_len, hidden_dim), take the last token
                 activation = activation[-1]
-            activations[grid_idx] = activation
+            activations[env_idx] = activation
             loaded += 1
         except Exception as e:
             # Only print warnings for non-404 errors (404s are expected for missing grids)
             if "404" not in str(e) and "Not Found" not in str(e):
-                print(f"Warning: Could not load activations for grid_{grid_idx}: {e}")
+                print(f"Warning: Could not load activations for env_{env_idx}: {e}")
             continue
 
-    print(f"Successfully loaded {loaded}/{len(grid_indices)} grids")
+    print(f"Successfully loaded {loaded}/{len(grid_indices)} activations")
     return activations
 
 
@@ -423,19 +492,25 @@ def load_activations_from_local(
     activations_dir: str,
     layer: int,
     grid_indices: list | None = None,
+    hf_repo_id: str | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Load activations from local directory.
+    """Load activations from local directory or HuggingFace repository.
     
-    Expects directory structure:
+    Supports two modes:
+    1. Local directory structure:
         activations_dir/
             env_{env_idx}_step_{step}/layer_{layer}/activations.pt
         OR
             env_{env_idx}/layer_{layer}/activations.pt
     
+    2. HuggingFace repository (if hf_repo_id is provided):
+        Downloads from: {hf_repo_id}/activations/{activations_dir}/env_{env_idx}_step_0/layer_{layer}/activations.pt
+    
     Args:
-        activations_dir: Path to directory containing activation files
+        activations_dir: Path to directory containing activation files (or subdirectory name for HF)
         layer: Layer number to load activations from
         grid_indices: List of env_idx values to load. If None, discovers all available.
+        hf_repo_id: HuggingFace repository ID (e.g., "project-telos/decoder"). If None, uses local filesystem.
     
     Returns:
         Dictionary mapping env_idx to activation tensor of shape (hidden_dim,)
@@ -443,6 +518,20 @@ def load_activations_from_local(
     import glob
     
     activations = {}
+    
+    # If using HuggingFace, use the existing load_activations_from_hf function
+    if hf_repo_id is not None:
+        # Extract subdirectory name (e.g., "7by7traingrids/full_prompt_activations")
+        hf_path = activations_dir
+        activations = load_activations_from_hf(
+            repo_id=hf_repo_id,
+            path_in_repo=f"activations/{hf_path}",
+            grid_indices=grid_indices,
+            layer=layer,
+        )
+        return activations
+    
+    # Local filesystem loading
     activations_dir = os.path.abspath(activations_dir)
     
     if grid_indices is None:
@@ -513,6 +602,7 @@ def load_action_sequences_from_csv(
     csv_path: str,
     grid_indices: list | None = None,
     max_seq_len: int | None = None,
+    add_eos_token: bool = True,
 ) -> dict[int, torch.Tensor]:
     """Load action sequences from CSV file.
 
@@ -564,6 +654,10 @@ def load_action_sequences_from_csv(
                         action_seq = torch.tensor(actions, dtype=torch.long)
                         if max_seq_len is not None and len(action_seq) > max_seq_len:
                             action_seq = action_seq[:max_seq_len]
+                        # Append EOS token if requested
+                        if add_eos_token:
+                            eos_token = torch.tensor([EOS_TOKEN_ID], dtype=torch.long)
+                            action_seq = torch.cat([action_seq, eos_token])
                         action_sequences[env_idx] = action_seq
                 except (json.JSONDecodeError, ValueError, TypeError) as e:
                     print(f"Warning: Failed to parse action_sequence for env_idx {env_idx}: {e}")
@@ -593,6 +687,10 @@ def load_action_sequences_from_csv(
                 action_seq = torch.tensor(actions, dtype=torch.long)
                 if max_seq_len is not None and len(action_seq) > max_seq_len:
                     action_seq = action_seq[:max_seq_len]
+                # Append EOS token if requested
+                if add_eos_token:
+                    eos_token = torch.tensor([EOS_TOKEN_ID], dtype=torch.long)
+                    action_seq = torch.cat([action_seq, eos_token])
                 action_sequences[env_idx] = action_seq
     else:
         raise ValueError("CSV must have either 'action_sequence' or 'last_action' column")

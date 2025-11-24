@@ -29,7 +29,13 @@ import pandas as pd
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from telos_interp.decoder_probe import ActionDecoderProbe, load_activations, load_activations_from_local
+from telos_interp.decoder_probe import (
+    EOS_TOKEN_ID,
+    ActionDecoderProbe,
+    load_activations,
+    load_activations_from_local,
+    load_activations_from_hf,
+)
 
 
 def main():
@@ -50,20 +56,32 @@ def main():
         "--activations-dir",
         type=str,
         default=None,
-        help="Directory containing activation files (for testing multiple grids)",
+        help="Directory containing activation files (for testing multiple grids) or subdirectory path for HF",
     )
     parser.add_argument(
         "--layer",
         type=int,
         default=None,
-        help="Layer number (required if using activations-dir)",
+        help="Layer number (required if using activations-dir or hf-repo-id)",
     )
     parser.add_argument(
         "--env-indices",
         type=int,
         nargs="+",
         default=None,
-        help="List of env_idx values to test (e.g., 0 1 2 3)",
+        help="List of env_idx values to test (e.g., 0 1 2 3). If not provided and using --test-csv, tests all grids in CSV.",
+    )
+    parser.add_argument(
+        "--test-csv",
+        type=str,
+        default=None,
+        help="Path to test CSV file with grid information (e.g., telos_interp/grids/7by7testgrids.csv)",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default=None,
+        help="HuggingFace repository ID for loading activations (e.g., 'project-telos/decoder'). If provided, loads from HF instead of local filesystem.",
     )
     parser.add_argument(
         "--max-length",
@@ -86,20 +104,25 @@ def main():
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.5,
-        help="Minimum confidence (probability) to continue generation (default: 0.5)",
+        default=0.0,
+        help="Minimum confidence (probability) to continue generation (default: 0.0, disabled). Lower values allow more uncertain predictions.",
     )
     parser.add_argument(
         "--max-repetition",
         type=int,
-        default=3,
-        help="Maximum consecutive identical actions before stopping (default: 3)",
+        default=10,
+        help="Maximum consecutive identical actions before stopping (default: 10, higher = less aggressive)",
     )
     parser.add_argument(
         "--entropy-threshold",
         type=float,
-        default=0.9,
-        help="Maximum entropy (uncertainty) before stopping (default: 0.9)",
+        default=2.0,
+        help="Maximum entropy (uncertainty) before stopping (default: 2.0, higher = less aggressive). For vocab_size=5, max entropy ≈ 1.609",
+    )
+    parser.add_argument(
+        "--disable-heuristic-stopping",
+        action="store_true",
+        help="Disable heuristic stopping (confidence, entropy, repetition). Only stop on EOS token or max_length.",
     )
     parser.add_argument(
         "--max-length-override",
@@ -128,7 +151,7 @@ def main():
         state_dict = checkpoint["model_state_dict"]
         # Try to get activation_dim from checkpoint metadata
         activation_dim = checkpoint.get("activation_dim", 2880)  # Default for gpt-oss-20b
-        vocab_size = checkpoint.get("vocab_size", 4)
+        vocab_size = checkpoint.get("vocab_size", 5)
         n_layer = checkpoint.get("n_layer", 4)
         n_head = checkpoint.get("n_head", 4)
         n_embd = checkpoint.get("n_embd", 256)
@@ -148,7 +171,7 @@ def main():
         if "action_embeddings.weight" in state_dict:
             vocab_size, _ = state_dict["action_embeddings.weight"].shape
         else:
-            vocab_size = 4
+            vocab_size = 5
         
         # Try to infer other params
         n_layer = 4
@@ -257,7 +280,10 @@ def main():
         
         # Generate actions
         print(f"\n🚀 Generating action sequence...")
-        print(f"Early stopping: min_confidence={args.min_confidence}, max_repetition={args.max_repetition}, entropy_threshold={args.entropy_threshold}")
+        if not args.disable_heuristic_stopping:
+            print(f"Early stopping: min_confidence={args.min_confidence}, max_repetition={args.max_repetition}, entropy_threshold={args.entropy_threshold}")
+        else:
+            print("Heuristic stopping disabled - only stopping on EOS token or max_length")
         with torch.no_grad():
             actions = model.generate(
                 activation,
@@ -267,6 +293,7 @@ def main():
                 max_repetition=args.max_repetition,
                 entropy_threshold=args.entropy_threshold,
                 max_length_override=args.max_length_override,
+                disable_heuristic_stopping=args.disable_heuristic_stopping,
             )
         
         actions_list = actions[0].cpu().tolist()
@@ -277,38 +304,94 @@ def main():
         action_str = " → ".join([action_names[a] for a in actions_list])
         print(f"  {action_str}")
         
-    elif args.activations_dir and args.layer is not None:
-        # Multiple activations from directory
-        if args.env_indices is None:
-            print("Error: --env-indices required when using --activations-dir")
-            sys.exit(1)
+    elif (args.activations_dir and args.layer is not None) or (args.test_csv and args.layer is not None):
+        # Multiple activations from directory or CSV
+        # Load CSV for grid information
+        if args.test_csv:
+            if not os.path.exists(args.test_csv):
+                print(f"Error: Test CSV file not found: {args.test_csv}")
+                sys.exit(1)
+            print(f"\n📥 Loading grid information from: {args.test_csv}")
+            df_grids = pd.read_csv(args.test_csv)
+            
+            # Infer activations_dir from CSV filename if not provided
+            if not args.activations_dir:
+                # Extract directory name from CSV filename (e.g., "7by7testgrids.csv" -> "7by7testgrids/full_prompt_activations")
+                csv_basename = os.path.basename(args.test_csv)
+                if "test" in csv_basename.lower():
+                    args.activations_dir = "7by7testgrids/full_prompt_activations"
+                elif "val" in csv_basename.lower():
+                    args.activations_dir = "7by7valgrids/full_prompt_activations"
+                elif "train" in csv_basename.lower():
+                    args.activations_dir = "7by7traingrids/full_prompt_activations"
+                else:
+                    print("Warning: Could not infer activations_dir from CSV filename. Please provide --activations-dir")
+                    if not args.hf_repo_id:
+                        print("Error: --activations-dir required when not using --hf-repo-id")
+                        sys.exit(1)
+            
+            # Get env_indices from CSV if not provided
+            if args.env_indices is None:
+                args.env_indices = sorted(df_grids["env_idx"].unique().tolist())
+                print(f"Found {len(args.env_indices)} grids in CSV. Testing all of them.")
+            else:
+                # Filter to only grids that exist in CSV
+                available_indices = set(df_grids["env_idx"].unique())
+                args.env_indices = [idx for idx in args.env_indices if idx in available_indices]
+                if len(args.env_indices) == 0:
+                    print("Error: None of the specified env_indices found in CSV")
+                    sys.exit(1)
+        else:
+            # Try to find CSV file (check common locations)
+            csv_paths = [
+                "telos_interp/grids/7by7testgrids.csv",
+                "telos_interp/grids/7by7traingrids.csv",
+                "telos_interp/grids/7by7valgrids.csv",
+                "outputs/7by7testgrids.csv",
+                "outputs/7by7traingrids.csv",
+                "outputs/7by7valgrids.csv",
+            ]
+            df_grids = None
+            for csv_path in csv_paths:
+                if os.path.exists(csv_path):
+                    try:
+                        df_grids = pd.read_csv(csv_path)
+                        print(f"Found grid CSV: {csv_path}")
+                        break
+                    except:
+                        continue
+            
+            if args.env_indices is None:
+                print("Error: --env-indices required when using --activations-dir without --test-csv")
+                sys.exit(1)
         
-        print(f"\n📥 Loading activations from: {args.activations_dir}")
-        activations = load_activations_from_local(
-            activations_dir=args.activations_dir,
-            layer=args.layer,
-            grid_indices=args.env_indices,
-        )
+        # Load activations
+        if args.hf_repo_id:
+            print(f"\n📥 Loading activations from HuggingFace: {args.hf_repo_id}")
+            print(f"  Path: {args.activations_dir}")
+            print(f"  Layer: {args.layer}")
+            activations = load_activations_from_hf(
+                repo_id=args.hf_repo_id,
+                path_in_repo=f"activations/{args.activations_dir}",
+                layer=args.layer,
+                grid_indices=args.env_indices,
+            )
+        else:
+            print(f"\n📥 Loading activations from: {args.activations_dir}")
+            activations = load_activations_from_local(
+                activations_dir=args.activations_dir,
+                layer=args.layer,
+                grid_indices=args.env_indices,
+            )
         
         print(f"Loaded {len(activations)} activations")
         
-        # Load CSV for grid information
-        csv_paths = [
-            "outputs/7by7testgrids.csv",
-            "outputs/7by7traingrids.csv",
-            "outputs/7by7valgrids.csv",
-        ]
-        df_grids = None
-        for csv_path in csv_paths:
-            if os.path.exists(csv_path):
-                try:
-                    df_grids = pd.read_csv(csv_path)
-                    break
-                except:
-                    continue
-        
         # Process each activation
         for env_idx in sorted(activations.keys()):
+            if env_idx not in activations:
+                print(f"Warning: Activation not found for env_idx {env_idx}, skipping...")
+                continue
+                
             activation = activations[env_idx]
             if activation.ndim > 1:
                 activation = activation[-1]  # Take last token if multi-token
@@ -318,45 +401,59 @@ def main():
             print(f"Environment {env_idx}:")
             print(f"{'='*60}")
             
-            # Try to load grid information from CSV
+            # Load grid information from CSV
+            grid_info = None
             if df_grids is not None:
                 try:
-                    row = df_grids[(df_grids["env_idx"] == env_idx) & (df_grids["trajectory_step"] == 0)]
+                    # Try to get row with trajectory_step == 0 first, then any row
+                    row = df_grids[(df_grids["env_idx"] == env_idx) & (df_grids.get("trajectory_step", 0) == 0)]
+                    if len(row) == 0:
+                        row = df_grids[df_grids["env_idx"] == env_idx]
                     if len(row) > 0:
                         grid_info = row.iloc[0]
+                except Exception as e:
+                    print(f"Warning: Could not load grid info for env_idx {env_idx}: {e}")
+            
+            # Display grid
+            if grid_info is not None:
+                # Print grid observation
+                if "fo_observation" in grid_info and pd.notna(grid_info["fo_observation"]):
+                    print("\n📊 Grid:")
+                    print(grid_info["fo_observation"])
+                
+                # Print start and goal positions
+                if "start_pos" in grid_info and pd.notna(grid_info["start_pos"]):
+                    print(f"\n📍 Start position: {grid_info['start_pos']}")
+                if "goal_pos" in grid_info and pd.notna(grid_info["goal_pos"]):
+                    print(f"🎯 Goal position: {grid_info['goal_pos']}")
+                
+                # Print optimal trajectory length
+                if "optimal_trajectory_length" in grid_info and pd.notna(grid_info["optimal_trajectory_length"]):
+                    print(f"📏 Optimal trajectory length: {int(grid_info['optimal_trajectory_length'])}")
+                
+                # Print ground truth action sequence if available
+                true_actions = None
+                if "action_sequence" in grid_info and pd.notna(grid_info["action_sequence"]):
+                    import json
+                    try:
+                        true_actions = json.loads(grid_info["action_sequence"])
+                        # Remove EOS token if present
+                        if len(true_actions) > 0 and true_actions[-1] == EOS_TOKEN_ID:
+                            true_actions = true_actions[:-1]
                         
-                        # Print grid observation
-                        if "fo_observation" in grid_info:
-                            print("Grid:")
-                            print(grid_info["fo_observation"])
-                        
-                        # Print start and goal positions
-                        if "start_pos" in grid_info and pd.notna(grid_info["start_pos"]):
-                            print(f"\nStart position: {grid_info['start_pos']}")
-                        if "goal_pos" in grid_info and pd.notna(grid_info["goal_pos"]):
-                            print(f"Goal position: {grid_info['goal_pos']}")
-                        
-                        # Print optimal trajectory length
-                        if "optimal_trajectory_length" in grid_info and pd.notna(grid_info["optimal_trajectory_length"]):
-                            print(f"Optimal trajectory length: {int(grid_info['optimal_trajectory_length'])}")
-                        
-                        # Print ground truth action sequence if available
-                        if "action_sequence" in grid_info and pd.notna(grid_info["action_sequence"]):
-                            import json
-                            try:
-                                true_actions = json.loads(grid_info["action_sequence"])
-                                action_names = ["LEFT", "RIGHT", "UP", "DOWN"]  # 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN
-                                true_seq_str = " → ".join([action_names[a] for a in true_actions])
-                                print(f"\nGround truth actions ({len(true_actions)}): {true_actions}")
-                                print(f"Ground truth sequence: {true_seq_str}")
-                            except:
-                                pass
-                        
-                        print("-" * 60)
-                except:
-                    pass
+                        action_names = ["LEFT", "RIGHT", "UP", "DOWN"]  # 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN
+                        true_seq_str = " → ".join([action_names[a] for a in true_actions])
+                        print(f"\n✅ Ground truth ({len(true_actions)} actions): {true_actions}")
+                        print(f"   {true_seq_str}")
+                    except Exception as e:
+                        print(f"Warning: Could not parse action_sequence: {e}")
+            else:
+                print("⚠️  No grid information available in CSV")
+            
+            print("-" * 60)
             
             # Generate actions
+            print(f"\n🚀 Generating prediction...")
             with torch.no_grad():
                 actions = model.generate(
                     activation,
@@ -366,15 +463,38 @@ def main():
                     max_repetition=args.max_repetition,
                     entropy_threshold=args.entropy_threshold,
                     max_length_override=args.max_length_override,
+                    disable_heuristic_stopping=args.disable_heuristic_stopping,
                 )
             
+            # Remove padding from predictions
             actions_list = actions[0].cpu().tolist()
-            print(f"Generated {len(actions_list)} actions: {actions_list}")
+            actions_list = [a for a in actions_list if a != -100]  # Remove padding
+            
             action_names = ["LEFT", "RIGHT", "UP", "DOWN"]  # 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN
-            action_str = " → ".join([action_names[a] for a in actions_list])
-            print(f"Sequence: {action_str}")
+            pred_seq_str = " → ".join([action_names[a] for a in actions_list])
+            
+            print(f"🤖 Prediction ({len(actions_list)} actions): {actions_list}")
+            print(f"   {pred_seq_str}")
+            
+            # Compare with ground truth if available
+            if true_actions is not None:
+                # Compare sequences
+                min_len = min(len(actions_list), len(true_actions))
+                matches = sum(1 for i in range(min_len) if actions_list[i] == true_actions[i])
+                accuracy = matches / len(true_actions) if len(true_actions) > 0 else 0.0
+                exact_match = (len(actions_list) == len(true_actions) and 
+                              all(actions_list[i] == true_actions[i] for i in range(len(true_actions))))
+                
+                print(f"\n📊 Comparison:")
+                print(f"   Token accuracy: {matches}/{len(true_actions)} ({accuracy*100:.1f}%)")
+                print(f"   Exact match: {'✅ YES' if exact_match else '❌ NO'}")
+                if not exact_match and len(actions_list) != len(true_actions):
+                    print(f"   Length: predicted={len(actions_list)}, ground_truth={len(true_actions)}")
     else:
-        print("Error: Must provide either --activation-path or (--activations-dir and --layer)")
+        print("Error: Must provide one of:")
+        print("  1. --activation-path (single activation file)")
+        print("  2. --activations-dir and --layer (local directory)")
+        print("  3. --test-csv and --layer (test from CSV, optionally with --hf-repo-id for HuggingFace)")
         sys.exit(1)
 
     print("\n" + "=" * 60)

@@ -22,6 +22,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from telos_interp.decoder_probe import (
+    EOS_TOKEN_ID,
     ActionDecoderProbe,
     create_dataset,
     load_action_sequences_from_csv,
@@ -65,8 +66,32 @@ def main():
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=4,
-        help="Action vocabulary size (default: 4 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN)",
+        default=5,
+        help="Action vocabulary size (default: 5 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=EOS)",
+    )
+    parser.add_argument(
+        "--add-eos-token",
+        action="store_true",
+        default=True,
+        help="Add EOS token to end of action sequences (default: True)",
+    )
+    parser.add_argument(
+        "--no-add-eos-token",
+        dest="add_eos_token",
+        action="store_false",
+        help="Don't add EOS token to end of action sequences",
+    )
+    parser.add_argument(
+        "--eos-weight-threshold",
+        type=float,
+        default=3.0,
+        help="Threshold for position-weighted EOS loss (default: 3.0). Higher values allow earlier EOS.",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default=None,
+        help="HuggingFace repository ID for loading activations (e.g., 'project-telos/decoder'). If None, uses local filesystem.",
     )
     parser.add_argument(
         "--n-layer",
@@ -145,6 +170,7 @@ def main():
     activations = load_activations_from_local(
         activations_dir=args.activations_dir,
         layer=args.layer,
+        hf_repo_id=args.hf_repo_id,
     )
     print(f"Loaded {len(activations)} activations")
 
@@ -153,6 +179,7 @@ def main():
     action_sequences = load_action_sequences_from_csv(
         csv_path=args.train_csv,
         max_seq_len=args.max_seq_len,
+        add_eos_token=args.add_eos_token,
     )
     print(f"Loaded {len(action_sequences)} action sequences")
 
@@ -167,30 +194,32 @@ def main():
 
     if args.val_csv:
         print("\n📥 Loading validation activations and sequences...")
+        val_activations_dir = args.activations_dir.replace("traingrids", "valgrids") if "traingrids" in args.activations_dir else args.activations_dir
         val_activations = load_activations_from_local(
-            activations_dir=args.activations_dir.replace("traingrids", "valgrids")
-            if "traingrids" in args.activations_dir
-            else args.activations_dir,
+            activations_dir=val_activations_dir,
             layer=args.layer,
+            hf_repo_id=args.hf_repo_id,
         )
         val_action_sequences = load_action_sequences_from_csv(
             csv_path=args.val_csv,
             max_seq_len=args.max_seq_len,
+            add_eos_token=args.add_eos_token,
         )
         val_dataset = create_dataset(val_activations, val_action_sequences, max_seq_len=args.max_seq_len, vocab_size=args.vocab_size)
         print(f"Created {len(val_dataset)} validation pairs")
 
     if args.test_csv:
         print("\n📥 Loading test activations and sequences...")
+        test_activations_dir = args.activations_dir.replace("traingrids", "testgrids") if "traingrids" in args.activations_dir else args.activations_dir
         test_activations = load_activations_from_local(
-            activations_dir=args.activations_dir.replace("traingrids", "testgrids")
-            if "traingrids" in args.activations_dir
-            else args.activations_dir,
+            activations_dir=test_activations_dir,
             layer=args.layer,
+            hf_repo_id=args.hf_repo_id,
         )
         test_action_sequences = load_action_sequences_from_csv(
             csv_path=args.test_csv,
             max_seq_len=args.max_seq_len,
+            add_eos_token=args.add_eos_token,
         )
         test_dataset = create_dataset(test_activations, test_action_sequences, max_seq_len=args.max_seq_len, vocab_size=args.vocab_size)
         print(f"Created {len(test_dataset)} test pairs")
@@ -212,6 +241,7 @@ def main():
         n_head=args.n_head,
         n_embd=args.n_embd,
         max_seq_len=args.max_seq_len,
+        eos_loss_weight_threshold=args.eos_weight_threshold,
     )
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
 
@@ -298,21 +328,49 @@ def main():
                 for i in range(predictions.shape[0]):
                     seq_len = seq_lens[i].item()
                     if seq_len > 0:
-                        # Use actual sequence length (not padded length)
-                        pred_seq = predictions[i, :seq_len].cpu()
-                        true_seq = action_seq_batch[i, :seq_len].cpu()
+                        # Get true sequence (includes EOS token at the end if add_eos_token was True)
+                        true_seq_full = action_seq_batch[i, :seq_len].cpu()
                         
-                        # Token-level accuracy
-                        mask = true_seq != -100  # Valid tokens (not padding)
-                        valid_tokens = mask.sum().item()
-                        if valid_tokens > 0:
-                            total_tokens += valid_tokens
-                            correct_tokens += ((pred_seq == true_seq) & mask).sum().item()
+                        # Remove EOS token from true sequence for comparison
+                        # (since generate() removes EOS from predictions)
+                        eos_mask = (true_seq_full == EOS_TOKEN_ID)
+                        if eos_mask.any():
+                            # Find first EOS and truncate before it
+                            eos_indices = eos_mask.nonzero(as_tuple=True)[0]
+                            if len(eos_indices) > 0:
+                                true_seq = true_seq_full[:eos_indices[0]]
+                            else:
+                                true_seq = true_seq_full
+                        else:
+                            true_seq = true_seq_full
                         
-                        # Sequence-level exact match
-                        if valid_tokens > 0:
-                            if torch.equal(pred_seq[mask], true_seq[mask]):
-                                exact_matches += 1
+                        # Get prediction sequence (EOS already removed by generate())
+                        pred_seq = predictions[i].cpu()  # Get full prediction
+                        
+                        # Remove padding from both sequences
+                        true_mask = true_seq != -100
+                        pred_mask = pred_seq != -100
+                        
+                        true_seq_valid = true_seq[true_mask]
+                        pred_seq_valid = pred_seq[pred_mask]
+                        
+                        # Compare up to minimum length
+                        min_len = min(len(true_seq_valid), len(pred_seq_valid))
+                        if min_len > 0:
+                            true_seq_compare = true_seq_valid[:min_len]
+                            pred_seq_compare = pred_seq_valid[:min_len]
+                            
+                            # Token-level accuracy
+                            total_tokens += min_len
+                            correct_tokens += (pred_seq_compare == true_seq_compare).sum().item()
+                            
+                            # Sequence-level exact match (only if full sequences match)
+                            if len(true_seq_valid) == len(pred_seq_valid):
+                                if torch.equal(true_seq_valid, pred_seq_valid):
+                                    exact_matches += 1
+                            total_sequences += 1
+                        elif len(true_seq_valid) > 0:
+                            # Prediction is empty but true sequence has actions
                             total_sequences += 1
 
         test_token_acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
