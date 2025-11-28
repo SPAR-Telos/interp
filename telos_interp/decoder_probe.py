@@ -13,8 +13,14 @@ from torch import nn
 
 from telos_interp.probing import load_activations
 
-# EOS token ID (end-of-sequence marker)
-EOS_TOKEN_ID = 4
+# Special token IDs
+# Actions: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN
+SOS_TOKEN_ID = 4  # Start-of-Sequence token
+EOS_TOKEN_ID = 5  # End-of-Sequence token
+PAD_TOKEN_ID = 6  # Padding token
+
+# Vocabulary size: 4 actions + 3 special tokens = 7
+DEFAULT_VOCAB_SIZE = 7
 
 
 class ActionDecoderProbe(nn.Module):
@@ -25,7 +31,7 @@ class ActionDecoderProbe(nn.Module):
 
     Args:
         activation_dim: Dimension of the input LLM activation vector
-        vocab_size: Number of action tokens (default: 5 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=EOS)
+        vocab_size: Vocabulary size (default: 7 for 0-3=actions, 4=SOS, 5=EOS, 6=PAD)
         n_layer: Number of transformer decoder layers (default: 4)
         n_head: Number of attention heads (default: 4)
         n_embd: Hidden dimension of the decoder (default: 256)
@@ -38,7 +44,7 @@ class ActionDecoderProbe(nn.Module):
     def __init__(
         self,
         activation_dim: int,
-        vocab_size: int = 5,
+        vocab_size: int = DEFAULT_VOCAB_SIZE,
         n_layer: int = 4,
         n_head: int = 4,
         n_embd: int = 256,
@@ -88,17 +94,22 @@ class ActionDecoderProbe(nn.Module):
     def forward(
         self,
         activation: torch.Tensor,
-        action_ids: torch.Tensor | None = None,
+        decoder_input: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass through the decoder probe.
 
         Args:
             activation: LLM activation tensor of shape (batch_size, activation_dim)
-            action_ids: Action token IDs of shape (batch_size, seq_len) for teacher forcing.
-                If None and labels is provided, uses labels shifted by one position.
-            labels: Target action token IDs of shape (batch_size, seq_len) for computing loss.
+            decoder_input: Decoder input sequence of shape (batch_size, seq_len) for teacher forcing.
+                Should start with SOS token: [SOS, action_0, action_1, ...]
+                If None and labels is provided, constructs from labels (SOS + labels[:-1]).
+            labels: Target sequence of shape (batch_size, seq_len) for computing loss.
+                Should be: [action_0, action_1, ..., action_n, EOS, PAD, ...]
                 If None, only returns logits.
+            attention_mask: Attention mask of shape (batch_size, seq_len) where 1 = valid token, 0 = PAD.
+                If None, created from decoder_input (1 where != PAD_TOKEN_ID).
 
         Returns:
             If labels is not None, returns (loss, logits) tuple.
@@ -116,86 +127,159 @@ class ActionDecoderProbe(nn.Module):
         activation_embed = self.activation_projection(activation)  # (batch_size, n_embd)
         activation_embed = activation_embed.unsqueeze(1)  # (batch_size, 1, n_embd) - this is the "prefix"
 
-        # Truncate labels to max_seq_len - 1 if provided
-        # This ensures position indices don't exceed embedding range (since positions start at 1)
-        if labels is not None and labels.shape[1] > self.max_seq_len - 1:
-            labels = labels[:, :self.max_seq_len - 1]
-        
-        if action_ids is None and labels is not None:
-            # For training: shift labels to create input sequence (teacher forcing)
-            # Shift: [action_0, action_1, ..., action_n] -> [0, action_0, ..., action_{n-1}]
+        # Construct decoder_input from labels if not provided (teacher forcing)
+        if decoder_input is None and labels is not None:
+            # For training: decoder_input = [SOS] + labels[:-1] (with EOS replaced by PAD)
+            # labels = [action_0, action_1, ..., action_n, EOS, PAD, ...]
+            # decoder_input = [SOS, action_0, action_1, ..., action_n, PAD, ...]
+            # We want to predict action_i given [SOS, action_0, ..., action_{i-1}]
+            # And predict EOS given [SOS, action_0, ..., action_n]
             seq_len = labels.shape[1]
             if seq_len > 0:
-                # Clamp labels to valid range [0, vocab_size-1] before using
                 labels_clamped = torch.clamp(labels, 0, self.vocab_size - 1)
-                action_ids = torch.cat(
-                    [torch.zeros(batch_size, 1, dtype=torch.long, device=device), labels_clamped[:, :-1]], dim=1
+                # Replace EOS with PAD in labels for decoder_input (EOS should not appear in input)
+                labels_for_input = torch.where(labels_clamped == EOS_TOKEN_ID, PAD_TOKEN_ID, labels_clamped)
+                # Shift by one position and prepend SOS
+                decoder_input = torch.cat(
+                    [torch.full((batch_size, 1), SOS_TOKEN_ID, dtype=torch.long, device=device), 
+                     labels_for_input[:, :-1]], dim=1
                 )
             else:
-                action_ids = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
-        elif action_ids is None:
-            # For inference: start with just activation
-            action_ids = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
+                decoder_input = torch.full((batch_size, 1), SOS_TOKEN_ID, dtype=torch.long, device=device)
+        elif decoder_input is None:
+            # For inference: start with SOS token
+            decoder_input = torch.full((batch_size, 1), SOS_TOKEN_ID, dtype=torch.long, device=device)
+        
+        # Create attention mask if not provided
+        if attention_mask is None:
+            # 1 where token is not PAD, 0 where token is PAD
+            attention_mask = (decoder_input != PAD_TOKEN_ID).long()  # (batch_size, seq_len)
+        
+        # Truncate to max_seq_len if needed
+        if decoder_input.shape[1] > self.max_seq_len:
+            decoder_input = decoder_input[:, :self.max_seq_len]
+            attention_mask = attention_mask[:, :self.max_seq_len]
+        
+        if labels is not None and labels.shape[1] > self.max_seq_len:
+            labels = labels[:, :self.max_seq_len]
 
-        # Build target sequence embeddings
-        if action_ids.shape[1] > 0:
-            # Clamp action_ids to valid range [0, vocab_size-1]
-            action_ids = torch.clamp(action_ids, 0, self.vocab_size - 1)
-            # Truncate to max_seq_len - 1 if needed (to ensure position indices are valid)
-            if action_ids.shape[1] > self.max_seq_len - 1:
-                action_ids = action_ids[:, :self.max_seq_len - 1]
-            
-            action_embeds = self.action_embeddings(action_ids)  # (batch_size, seq_len, n_embd)
-            # Add position embeddings (starting from position 1, since activation is at position 0)
-            # Position embeddings have indices [0, max_seq_len-1]
-            # Since positions start at 1, we need seq_len <= max_seq_len - 1 to ensure max position <= max_seq_len - 1
-            seq_len = action_ids.shape[1]
-            if seq_len > self.max_seq_len - 1:
-                # Truncate to ensure positions don't exceed embedding range
-                seq_len = self.max_seq_len - 1
-                action_ids = action_ids[:, :seq_len]
-                action_embeds = self.action_embeddings(action_ids)
-            
-            # Generate positions [1, 2, ..., seq_len] where seq_len <= max_seq_len - 1
-            # So max position is seq_len <= max_seq_len - 1, which is valid for embedding
-            positions = torch.arange(1, seq_len + 1, device=device).unsqueeze(0).expand(batch_size, -1)
-            pos_embeds = self.position_embeddings(positions)
-            target_embeds = action_embeds + pos_embeds  # (batch_size, seq_len, n_embd)
-        else:
-            # No actions yet, just use activation as both memory and target
-            target_embeds = activation_embed  # (batch_size, 1, n_embd)
+        # Build decoder input sequence embeddings
+        seq_len = decoder_input.shape[1]
+        
+        # Clamp decoder_input to valid range [0, vocab_size-1]
+        decoder_input = torch.clamp(decoder_input, 0, self.vocab_size - 1)
+        
+        # Embed decoder input tokens
+        decoder_embeds = self.action_embeddings(decoder_input)  # (batch_size, seq_len, n_embd)
+        
+        # CRITICAL DEBUG: Check if action_embeddings output requires grad
+        if self.training and torch.isnan(decoder_embeds).any():
+            print("ERROR: NaN in decoder_embeds immediately after action_embeddings!")
+            print(f"  decoder_input sample: {decoder_input[0, :5].cpu().tolist()}")
+            print(f"  action_embeddings.weight has NaN: {torch.isnan(self.action_embeddings.weight).any()}")
+            decoder_embeds = torch.nan_to_num(decoder_embeds, nan=0.0)
+        
+        # Add position embeddings (starting from position 0 for SOS, 1 for first action, etc.)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        # Clamp positions to valid range [0, max_seq_len-1]
+        positions = torch.clamp(positions, 0, self.max_seq_len - 1)
+        pos_embeds = self.position_embeddings(positions)
+        decoder_embeds = decoder_embeds + pos_embeds  # (batch_size, seq_len, n_embd)
+        
+        # Check if decoder_embeds still requires grad after adding position embeddings
+        if self.training and not decoder_embeds.requires_grad:
+            print("ERROR: decoder_embeds lost requires_grad after position embedding addition!")
+        
+        # Store decoder_embeds for regularization (to ensure gradients flow to action_embeddings)
+        if labels is not None:
+            self._decoder_embeds_for_reg = decoder_embeds
 
-        # Use transformer decoder:
-        # - memory (activation_embed): the prefix/context from LLM activation
-        # - tgt (target_embeds): the action sequence being generated
-        # The decoder attends to both the memory (activation) and previous tokens in the sequence
+        # Create attention masks for transformer decoder
+        # A. Causal (Look-Ahead) Mask: Prevents attending to future tokens
+        #    Creates a triangular mask where position i can only attend to positions <= i
+        #    Shape: (seq_len, seq_len)
+        #    PyTorch convention: True = MASKED (cannot attend), False = UNMASKED (can attend)
+        #    torch.triu(..., diagonal=1) gives True above diagonal = future positions masked
+        tgt_mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+        
+        # B. Padding Mask: Prevents attending to PAD tokens
+        #    Shape: (batch_size, seq_len)
+        #    True = PAD token (should be masked), False = valid token
+        tgt_key_padding_mask = (attention_mask == 0)  # True where PAD, False where valid
+        
+        # PyTorch TransformerDecoderLayer automatically combines:
+        # 1. Causal mask (tgt_mask) - applied in self-attention
+        # 2. Padding mask (tgt_key_padding_mask) - applied to mask out PAD tokens
+        # The padding mask is combined with causal mask: tokens cannot attend to:
+        #   - Future tokens (causal mask)
+        #   - PAD tokens (padding mask)
+        
         decoder_output = self.decoder_layers(
-            tgt=target_embeds, memory=activation_embed
+            tgt=decoder_embeds, 
+            memory=activation_embed,
+            tgt_mask=tgt_mask,  # Causal mask: (seq_len, seq_len)
+            tgt_key_padding_mask=tgt_key_padding_mask  # Padding mask: (batch_size, seq_len)
         )  # (batch_size, seq_len, n_embd)
+        
+        # Store decoder_output for regularization loss (to ensure gradient flow to decoder_layers)
+        # This is CRITICAL: regularizing decoder_output gives gradients to decoder_layers
+        # Regularizing decoder_embeds only gives gradients to action_embeddings
+        if labels is not None:
+            self._decoder_output_for_reg = decoder_output
+        
+        # Check for NaN in decoder_output immediately and fix to prevent gradient flow issues
+        if torch.isnan(decoder_output).any():
+            if self.training:
+                print("Warning: NaN in decoder_output! This will break gradient flow to action_embeddings.")
+                print(f"  decoder_embeds stats: min={decoder_embeds.min().item():.4f}, max={decoder_embeds.max().item():.4f}")
+                print(f"  decoder_embeds has NaN: {torch.isnan(decoder_embeds).any()}")
+            # Replace NaN with zeros to maintain computation graph
+            decoder_output = torch.nan_to_num(decoder_output, nan=0.0)
 
         # Project to vocabulary
         logits = self.lm_head(decoder_output)  # (batch_size, seq_len, vocab_size)
+        
+        # Debug: Check for NaN/Inf in logits (only in training mode)
+        if self.training and torch.isnan(logits).any():
+            print("Warning: NaN detected in logits!")
+            print(f"  Decoder output stats: min={decoder_output.min().item():.4f}, max={decoder_output.max().item():.4f}")
+            print(f"  Decoder output has NaN: {torch.isnan(decoder_output).any()}")
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+        elif self.training and torch.isinf(logits).any():
+            print("Warning: Inf detected in logits!")
+            logits = torch.clamp(logits, min=-1e6, max=1e6)
 
         if labels is not None:
-            # Truncate labels to match logits length (which is based on action_ids/seq_len)
+            # Truncate labels to match logits length
             seq_len_used = logits.shape[1]
             if labels.shape[1] > seq_len_used:
                 labels = labels[:, :seq_len_used]
-            # Clamp labels to valid range [0, vocab_size-1] (ignore padding -100)
-            labels = torch.where(labels == -100, labels, torch.clamp(labels, 0, self.vocab_size - 1))
+            
+            # Clamp labels to valid range [0, vocab_size-1]
+            labels = torch.clamp(labels, 0, self.vocab_size - 1)
             
             # Compute per-token loss for position-weighted EOS loss
             logits_flat = logits.view(-1, self.vocab_size)  # (batch_size * seq_len, vocab_size)
             labels_flat = labels.view(-1)  # (batch_size * seq_len)
             
+            # Create mask for PAD tokens (ignore PAD in loss)
+            pad_mask = (labels_flat != PAD_TOKEN_ID)  # (batch_size * seq_len,)
+            
             # Compute per-token loss (reduction='none')
-            per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none')
+            # Use ignore_index=PAD_TOKEN_ID to ignore padding tokens
+            per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=PAD_TOKEN_ID, reduction='none')
+            
+            # Check for NaN in per_token_loss before processing
+            if torch.isnan(per_token_loss).any():
+                print(f"Warning: NaN in per_token_loss! Replacing with zeros for PAD positions.")
+                # Replace NaN with 0 (they should be 0 for PAD tokens anyway due to ignore_index)
+                per_token_loss = torch.nan_to_num(per_token_loss, nan=0.0)
             
             # Apply position-weighted loss for EOS token to prevent mode collapse
             # Reshape to (batch_size, seq_len) for position indexing
-            batch_size = labels.shape[0]
             per_token_loss_2d = per_token_loss.view(batch_size, seq_len_used)
             labels_2d = labels_flat.view(batch_size, seq_len_used)
+            pad_mask_2d = pad_mask.view(batch_size, seq_len_used)
             
             # Create position indices: [0, 1, 2, ..., seq_len-1]
             position_indices = torch.arange(seq_len_used, device=labels.device, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
@@ -205,16 +289,69 @@ class ActionDecoderProbe(nn.Module):
             eos_weights = torch.clamp((position_indices + 1.0) / self.eos_loss_weight_threshold, max=1.0)
             
             # Apply weights: use eos_weights for EOS tokens, 1.0 for non-EOS tokens
-            is_eos = (labels_2d == EOS_TOKEN_ID) & (labels_2d != -100)
+            is_eos = (labels_2d == EOS_TOKEN_ID) & pad_mask_2d
             loss_weights = torch.where(is_eos, eos_weights, torch.ones_like(eos_weights))
             
             # Apply weights to per-token loss
             weighted_loss = per_token_loss_2d * loss_weights
             
-            # Mask out padding tokens (-100) and compute mean
-            valid_mask = (labels_2d != -100)
-            loss = weighted_loss[valid_mask].sum() / valid_mask.sum().clamp(min=1)
+            # Mask out padding tokens and compute mean
+            # CRITICAL FIX: Use masked_fill instead of indexing to maintain computation graph
+            # Indexing with pad_mask_2d creates a new tensor that breaks gradient flow
+            # masked_fill maintains connection to ALL positions while zeroing invalid ones
+            num_valid = pad_mask_2d.sum()
             
+            # Safety check: ensure we have valid tokens
+            if num_valid == 0:
+                # If no valid tokens (shouldn't happen), create a small loss from logits to maintain gradient flow
+                print("Warning: No valid tokens in loss calculation! This should not happen.")
+                # Use a small regularization loss that maintains gradient flow to all parameters
+                loss = (logits ** 2).sum() * 1e-6  # Small L2 regularization that flows gradients
+            else:
+                # Use masked_fill to zero out invalid positions while maintaining computation graph
+                # This ensures gradients flow through ALL positions: decoder_output → decoder_layers → action_embeddings
+                masked_loss = weighted_loss.masked_fill(~pad_mask_2d, 0.0)
+                # Sum over ALL positions (masked positions are zero, so they don't contribute to loss)
+                # But gradients still flow through them to maintain the computation graph
+                main_loss = masked_loss.sum() / num_valid.clamp(min=1)
+                
+                # CRITICAL FIX: Add regularization to ensure gradients flow to all layers
+                # The main loss gradient is very small for decoder_layers (1e-8) because:
+                # 1. Most positions are PAD (don't contribute to loss)
+                # 2. Attention softmax causes vanishing gradients
+                # 3. Only ~20% of tokens are valid
+                # We add stronger regularization to force meaningful gradient flow
+                reg_loss = torch.tensor(0.0, device=main_loss.device)
+                
+                # Regularize decoder_output to train decoder_layers
+                # Weight of 0.001 provides gradient signal without pushing values to zero
+                # (0.1 was too aggressive and caused NaN during inference)
+                if hasattr(self, '_decoder_output_for_reg') and self._decoder_output_for_reg is not None:
+                    reg_loss = reg_loss + (self._decoder_output_for_reg ** 2).mean() * 0.001
+                
+                # Regularize decoder_embeds to train action_embeddings and position_embeddings
+                if hasattr(self, '_decoder_embeds_for_reg') and self._decoder_embeds_for_reg is not None:
+                    reg_loss = reg_loss + (self._decoder_embeds_for_reg ** 2).mean() * 0.001
+                
+                loss = main_loss + reg_loss
+            
+            # Check for NaN or Inf - if present, use simple unweighted loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: Loss is NaN/Inf, using simple unweighted loss. num_valid={num_valid}")
+                # Use simple unweighted loss without position weighting
+                simple_loss = per_token_loss[pad_mask].sum() / pad_mask.sum().clamp(min=1)
+                if torch.isnan(simple_loss) or torch.isinf(simple_loss):
+                    print("Warning: Simple loss also NaN/Inf, using regularization loss")
+                    # Last resort: use L2 regularization on logits to maintain gradient flow
+                    loss = (logits ** 2).sum() * 1e-6
+                else:
+                    loss = simple_loss
+            
+            # Clean up temporary storage
+            if hasattr(self, '_decoder_output_for_reg'):
+                delattr(self, '_decoder_output_for_reg')
+            if hasattr(self, '_decoder_embeds_for_reg'):
+                delattr(self, '_decoder_embeds_for_reg')
             return loss, logits
         return logits
 
@@ -264,30 +401,66 @@ class ActionDecoderProbe(nn.Module):
         # Project activation to embedding space (this is the memory/prefix)
         activation_embed = self.activation_projection(activation).unsqueeze(1)  # (batch_size, 1, n_embd)
 
+        # Start with SOS token
+        decoder_input = torch.full((batch_size, 1), SOS_TOKEN_ID, dtype=torch.long, device=device)
         generated = []
+        
         with torch.no_grad():
             # Generate tokens autoregressively
             for step in range(effective_max_length):
-                if step == 0:
-                    # First step: use activation as target (empty sequence)
-                    target_embeds = activation_embed  # (batch_size, 1, n_embd)
-                else:
-                    # Subsequent steps: embed generated actions so far
-                    past_action_ids = torch.stack(generated, dim=1)  # (batch_size, step)
-                    past_action_embeds = self.action_embeddings(past_action_ids)  # (batch_size, step, n_embd)
-                    positions = torch.arange(1, step + 1, device=device).unsqueeze(0).expand(batch_size, -1)
-                    pos_embeds = self.position_embeddings(positions)
-                    past_action_embeds = past_action_embeds + pos_embeds
-
-                    # Concatenate with activation for decoder input
-                    target_embeds = torch.cat([activation_embed, past_action_embeds], dim=1)
-
-                # Run through decoder
-                decoder_output = self.decoder_layers(tgt=target_embeds, memory=activation_embed)
+                # Early stopping if we've generated enough tokens
+                if len(generated) > 0 and len(generated) >= effective_max_length:
+                    break
+                # Embed decoder input (SOS + generated actions so far)
+                decoder_embeds = self.action_embeddings(decoder_input)  # (batch_size, seq_len, n_embd)
+                
+                # Add position embeddings
+                seq_len = decoder_input.shape[1]
+                positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+                positions = torch.clamp(positions, 0, self.max_seq_len - 1)
+                pos_embeds = self.position_embeddings(positions)
+                decoder_embeds = decoder_embeds + pos_embeds
+                
+                # Create attention masks for generation
+                # A. Causal mask: Prevent attending to future tokens
+                #    PyTorch convention: True = MASKED (cannot attend), False = UNMASKED (can attend)
+                tgt_mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+                
+                # B. Padding mask: No padding during generation (all tokens are valid)
+                attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
+                tgt_key_padding_mask = (attention_mask == 0)  # False for all (no padding during generation)
+                
+                # Run through decoder with both causal and padding masks
+                decoder_output = self.decoder_layers(
+                    tgt=decoder_embeds, 
+                    memory=activation_embed,
+                    tgt_mask=tgt_mask,  # Causal mask
+                    tgt_key_padding_mask=tgt_key_padding_mask  # Padding mask (all False = no padding)
+                )
+                
+                # Check for NaN in decoder output
+                if torch.isnan(decoder_output).any():
+                    print(f"Warning: NaN detected in decoder_output at step {step}")
+                    print(f"  This indicates the model weights may be corrupted or untrained")
+                    print(f"  decoder_embeds stats: min={decoder_embeds.min().item():.4f}, max={decoder_embeds.max().item():.4f}")
+                    print(f"  decoder_embeds has NaN: {torch.isnan(decoder_embeds).any()}")
+                    # Replace NaN to allow generation to continue (though results will be garbage)
+                    decoder_output = torch.nan_to_num(decoder_output, nan=0.0)
+                
                 logits = self.lm_head(decoder_output)  # (batch_size, seq_len, vocab_size)
+                
+                # Check for NaN in logits
+                if torch.isnan(logits).any():
+                    print(f"Warning: NaN detected in logits at step {step}, stopping generation")
+                    break
 
                 # Get logits for the last position (next token prediction)
                 next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
+                
+                # Check for NaN before processing
+                if torch.isnan(next_token_logits).any():
+                    print(f"Warning: NaN in next_token_logits at step {step}, stopping generation")
+                    break
 
                 # Apply temperature
                 next_token_logits = next_token_logits / temperature
@@ -309,18 +482,46 @@ class ActionDecoderProbe(nn.Module):
 
                 # Sample next token
                 probs = torch.softmax(next_token_logits, dim=-1)
+                
+                # Debug: Check for NaN/Inf in probabilities
+                if torch.isnan(probs).any() or torch.isinf(probs).any():
+                    # Instead of stopping, use uniform distribution over VALID ACTIONS ONLY (0-3)
+                    # This allows generation to continue (though results may be poor)
+                    # Don't sample SOS (4), EOS (5), or PAD (6)
+                    probs = torch.zeros_like(probs)
+                    probs[:, :4] = 0.25  # Uniform over actions 0, 1, 2, 3 only
+                
+                # Check for negative probabilities (shouldn't happen after softmax, but just in case)
+                if (probs < 0).any():
+                    print(f"Warning: Negative probabilities at step {step}, clamping to 0")
+                    probs = torch.clamp(probs, min=0.0)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+                
                 next_token = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
                 next_token = next_token.squeeze(1)  # (batch_size,)
                 generated.append(next_token)
                 
-                # Check if EOS token was sampled - EOS takes priority over heuristic stopping
+                # Append to decoder_input for next iteration (but don't include EOS in input)
+                # Only append if not EOS (EOS signals end, so we don't need to continue)
                 eos_predicted = (next_token == EOS_TOKEN_ID)
                 if eos_predicted.any():
                     # If all sequences predicted EOS, stop completely
                     if eos_predicted.all():
                         break
+                    # For mixed batches, only append non-EOS tokens to decoder_input
+                    # Replace EOS with PAD for sequences that predicted EOS (they're done)
+                    next_token_for_input = torch.where(eos_predicted, torch.full_like(next_token, PAD_TOKEN_ID), next_token)
+                else:
+                    next_token_for_input = next_token
+                
+                # Update decoder_input for next iteration
+                decoder_input = torch.cat([decoder_input, next_token_for_input.unsqueeze(1)], dim=1)
+                
+                # Check if EOS token was sampled - EOS takes priority over heuristic stopping
+                if eos_predicted.any():
                     # For mixed batches, continue but EOS will be filtered out later
                     # Continue generation for non-EOS sequences only
+                    pass
                 
                 # Heuristic stopping (only if not disabled)
                 if not disable_heuristic_stopping:
@@ -521,11 +722,15 @@ def load_activations_from_local(
     
     # If using HuggingFace, use the existing load_activations_from_hf function
     if hf_repo_id is not None:
-        # Extract subdirectory name (e.g., "7by7traingrids/full_prompt_activations")
-        hf_path = activations_dir
+        # Construct path_in_repo: if activations_dir already starts with "activations/", use as-is
+        # Otherwise, prepend "activations/"
+        if activations_dir.startswith("activations/"):
+            path_in_repo = activations_dir
+        else:
+            path_in_repo = f"activations/{activations_dir}"
         activations = load_activations_from_hf(
             repo_id=hf_repo_id,
-            path_in_repo=f"activations/{hf_path}",
+            path_in_repo=path_in_repo,
             grid_indices=grid_indices,
             layer=layer,
         )
@@ -603,7 +808,7 @@ def load_action_sequences_from_csv(
     grid_indices: list | None = None,
     max_seq_len: int | None = None,
     add_eos_token: bool = True,
-) -> dict[int, torch.Tensor]:
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Load action sequences from CSV file.
 
     Supports two CSV formats:
@@ -616,14 +821,17 @@ def load_action_sequences_from_csv(
         max_seq_len: Maximum sequence length. If None, uses the longest sequence.
 
     Returns:
-        Dictionary mapping grid index to action sequence tensor of shape (seq_len,)
+        Tuple of (decoder_inputs, targets) dictionaries:
+        - decoder_inputs: Maps grid index to decoder input tensor [SOS, action_0, action_1, ...]
+        - targets: Maps grid index to target tensor [action_0, action_1, ..., EOS]
     """
     import json
     import pandas as pd
 
     df = pd.read_csv(csv_path)
 
-    action_sequences = {}
+    decoder_inputs = {}
+    targets = {}
     
     # Check which format we have
     has_action_sequence_col = "action_sequence" in df.columns
@@ -654,11 +862,18 @@ def load_action_sequences_from_csv(
                         action_seq = torch.tensor(actions, dtype=torch.long)
                         if max_seq_len is not None and len(action_seq) > max_seq_len:
                             action_seq = action_seq[:max_seq_len]
-                        # Append EOS token if requested
+                        
+                        # Create target: [action_0, action_1, ..., action_n, EOS]
                         if add_eos_token:
-                            eos_token = torch.tensor([EOS_TOKEN_ID], dtype=torch.long)
-                            action_seq = torch.cat([action_seq, eos_token])
-                        action_sequences[env_idx] = action_seq
+                            target = torch.cat([action_seq, torch.tensor([EOS_TOKEN_ID], dtype=torch.long)])
+                        else:
+                            target = action_seq
+                        
+                        # Create decoder_input: [SOS, action_0, action_1, ..., action_n]
+                        decoder_input = torch.cat([torch.tensor([SOS_TOKEN_ID], dtype=torch.long), action_seq])
+                        
+                        decoder_inputs[env_idx] = decoder_input
+                        targets[env_idx] = target
                 except (json.JSONDecodeError, ValueError, TypeError) as e:
                     print(f"Warning: Failed to parse action_sequence for env_idx {env_idx}: {e}")
                     continue
@@ -687,70 +902,85 @@ def load_action_sequences_from_csv(
                 action_seq = torch.tensor(actions, dtype=torch.long)
                 if max_seq_len is not None and len(action_seq) > max_seq_len:
                     action_seq = action_seq[:max_seq_len]
-                # Append EOS token if requested
+                
+                # Create target: [action_0, action_1, ..., action_n, EOS]
                 if add_eos_token:
-                    eos_token = torch.tensor([EOS_TOKEN_ID], dtype=torch.long)
-                    action_seq = torch.cat([action_seq, eos_token])
-                action_sequences[env_idx] = action_seq
+                    target = torch.cat([action_seq, torch.tensor([EOS_TOKEN_ID], dtype=torch.long)])
+                else:
+                    target = action_seq
+                
+                # Create decoder_input: [SOS, action_0, action_1, ..., action_n]
+                decoder_input = torch.cat([torch.tensor([SOS_TOKEN_ID], dtype=torch.long), action_seq])
+                
+                decoder_inputs[env_idx] = decoder_input
+                targets[env_idx] = target
     else:
         raise ValueError("CSV must have either 'action_sequence' or 'last_action' column")
 
-    return action_sequences
+    return decoder_inputs, targets
 
 
 def create_dataset(
     activations: dict[int, torch.Tensor],
-    action_sequences: dict[int, torch.Tensor],
+    decoder_inputs: dict[int, torch.Tensor],
+    targets: dict[int, torch.Tensor],
     max_seq_len: int | None = None,
-    vocab_size: int = 4,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Create dataset pairs of (activation, action_sequence).
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Create dataset tuples of (activation, decoder_input, target).
 
     Args:
         activations: Dictionary mapping grid index to activation tensor
-        action_sequences: Dictionary mapping grid index to action sequence tensor
+        decoder_inputs: Dictionary mapping grid index to decoder input tensor [SOS, action_0, ...]
+        targets: Dictionary mapping grid index to target tensor [action_0, ..., EOS]
         max_seq_len: Maximum sequence length. Sequences longer than this are truncated.
 
     Returns:
-        List of (activation, action_sequence) tuples
+        List of (activation, decoder_input, target) tuples
     """
     dataset = []
 
     # Find common grid indices
-    common_indices = set(activations.keys()) & set(action_sequences.keys())
+    common_indices = set(activations.keys()) & set(decoder_inputs.keys()) & set(targets.keys())
 
     for grid_idx in common_indices:
         activation = activations[grid_idx]
-        action_seq = action_sequences[grid_idx]
+        decoder_input = decoder_inputs[grid_idx]
+        target = targets[grid_idx]
 
-        # Validate and clamp action values to valid range [0, vocab_size-1]
-        action_seq = torch.clamp(action_seq, 0, vocab_size - 1)
+        # Validate and clamp token values to valid range [0, vocab_size-1]
+        decoder_input = torch.clamp(decoder_input, 0, DEFAULT_VOCAB_SIZE - 1)
+        target = torch.clamp(target, 0, DEFAULT_VOCAB_SIZE - 1)
         
         # Truncate if needed
-        if max_seq_len is not None and len(action_seq) > max_seq_len:
-            action_seq = action_seq[:max_seq_len]
+        if max_seq_len is not None:
+            if len(decoder_input) > max_seq_len:
+                decoder_input = decoder_input[:max_seq_len]
+            if len(target) > max_seq_len:
+                target = target[:max_seq_len]
 
-        dataset.append((activation, action_seq))
+        dataset.append((activation, decoder_input, target))
 
     return dataset
 
 
 def train_decoder_probe(
     model: ActionDecoderProbe,
-    dataset: list[tuple[torch.Tensor, torch.Tensor]],
+    dataset: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     batch_size: int = 32,
     num_epochs: int = 10,
     learning_rate: float = 1e-4,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_split: float = 0.2,
-    val_dataset: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    val_dataset: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
     save_path: str | None = None,
+    max_decoder_input_len: int | None = None,
+    max_target_len: int | None = None,
 ) -> dict:
     """Train the decoder probe model.
 
     Args:
         model: ActionDecoderProbe model to train
-        dataset: List of (activation, action_sequence) tuples
+        dataset: List of (activation, decoder_input, target) tuples
         batch_size: Batch size for training
         num_epochs: Number of training epochs
         learning_rate: Learning rate
@@ -781,44 +1011,73 @@ def train_decoder_probe(
         print(f"Split training data: {len(train_data)} train, {len(eval_data)} eval")
 
     # Prepare data for DataLoader
-    # We need to pad sequences to the same length, but cap at model's max_seq_len - 1
-    # (because positions start at 1, so max position is max_seq_len - 1)
     # Calculate max length across both train and eval datasets
-    all_data = train_data + (eval_data if eval_data else [])
-    dataset_max_len = max(len(seq) for _, seq in all_data) if all_data else 100
-    effective_max_len = min(dataset_max_len, model.max_seq_len - 1)
+    # If max lengths are provided (from all datasets including test), use those
+    # Otherwise calculate from available data
+    if max_decoder_input_len is None or max_target_len is None:
+        all_data = train_data + (eval_data if eval_data else [])
+        if max_decoder_input_len is None:
+            max_decoder_input_len = max(len(decoder_input) for _, decoder_input, _ in all_data) if all_data else 100
+        if max_target_len is None:
+            max_target_len = max(len(target) for _, _, target in all_data) if all_data else 100
+    
+    effective_max_decoder_len = min(max_decoder_input_len, model.max_seq_len)
+    effective_max_target_len = min(max_target_len, model.max_seq_len)
 
     def collate_fn(batch):
         activations = []
-        action_seqs = []
-        seq_lens = []
+        decoder_inputs = []
+        targets = []
+        attention_masks = []
 
-        for activation, action_seq in batch:
+        for activation, decoder_input, target in batch:
             activations.append(activation)
-            # Truncate if longer than model's max_seq_len - 1 (to account for position embedding limit)
-            if len(action_seq) > model.max_seq_len - 1:
-                action_seq = action_seq[:model.max_seq_len - 1]
-            seq_lens.append(len(action_seq))
-            # Pad sequence to effective_max_len
-            if len(action_seq) < effective_max_len:
-                padded_seq = torch.cat(
-                    [action_seq, torch.full((effective_max_len - len(action_seq),), -100, dtype=torch.long)]
+            
+            # Truncate if longer than max_seq_len
+            if len(decoder_input) > model.max_seq_len:
+                decoder_input = decoder_input[:model.max_seq_len]
+            if len(target) > model.max_seq_len:
+                target = target[:model.max_seq_len]
+            
+            # Pad decoder_input to effective_max_decoder_len with PAD tokens
+            if len(decoder_input) < effective_max_decoder_len:
+                padding = torch.full(
+                    (effective_max_decoder_len - len(decoder_input),), 
+                    PAD_TOKEN_ID, 
+                    dtype=torch.long
                 )
-            else:
-                padded_seq = action_seq
-            # Ensure all action values are in valid range [0, vocab_size-1] (ignore padding -100)
-            padded_seq = torch.where(padded_seq == -100, padded_seq, torch.clamp(padded_seq, 0, model.vocab_size - 1))
-            action_seqs.append(padded_seq)
+                decoder_input = torch.cat([decoder_input, padding])
+            
+            # Pad target to effective_max_target_len with PAD tokens
+            if len(target) < effective_max_target_len:
+                padding = torch.full(
+                    (effective_max_target_len - len(target),), 
+                    PAD_TOKEN_ID, 
+                    dtype=torch.long
+                )
+                target = torch.cat([target, padding])
+            
+            # Create attention mask: 1 for valid tokens, 0 for PAD
+            attention_mask = (decoder_input != PAD_TOKEN_ID).long()
+            
+            decoder_inputs.append(decoder_input)
+            targets.append(target)
+            attention_masks.append(attention_mask)
 
         activations_tensor = torch.stack(activations)
-        action_seqs_tensor = torch.stack(action_seqs)
-        return activations_tensor, action_seqs_tensor, torch.tensor(seq_lens)
+        decoder_inputs_tensor = torch.stack(decoder_inputs)
+        targets_tensor = torch.stack(targets)
+        attention_masks_tensor = torch.stack(attention_masks)
+        
+        return activations_tensor, decoder_inputs_tensor, targets_tensor, attention_masks_tensor
 
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     eval_loader = DataLoader(eval_data, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # Optimizer
+    # Optimizer - using same LR for all params, but we scale decoder_layers gradients by 1000x
+    # in the backward pass to combat vanishing gradients
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    print(f"  Optimizer: LR = {learning_rate:.2e}, decoder_layers gradients scaled by 1000x")
 
     # Training loop
     train_losses = []
@@ -830,16 +1089,108 @@ def train_decoder_probe(
         epoch_train_loss = 0.0
         num_train_batches = 0
 
-        for activations_batch, action_seqs_batch, seq_lens in train_loader:
+        for batch_idx, (activations_batch, decoder_inputs_batch, targets_batch, attention_masks_batch) in enumerate(train_loader):
             activations_batch = activations_batch.to(device).to(torch.float32)
-            action_seqs_batch = action_seqs_batch.to(device)
+            decoder_inputs_batch = decoder_inputs_batch.to(device)
+            targets_batch = targets_batch.to(device)
+            attention_masks_batch = attention_masks_batch.to(device)
+
+            # Debug: Print first batch of first epoch
+            if epoch == 0 and batch_idx == 0:
+                print("\n🔍 Debug: First training batch")
+                print(f"  Batch size: {activations_batch.shape[0]}")
+                print(f"  Activation shape: {activations_batch.shape}")
+                print(f"  Decoder input shape: {decoder_inputs_batch.shape}")
+                print(f"  Targets shape: {targets_batch.shape}")
+                print(f"  Attention mask shape: {attention_masks_batch.shape}")
+                print(f"  Sample decoder_input[0]: {decoder_inputs_batch[0].cpu().tolist()}")
+                print(f"  Sample target[0]: {targets_batch[0].cpu().tolist()}")
+                print(f"  Sample attention_mask[0]: {attention_masks_batch[0].cpu().tolist()}")
+                # Check token distribution in targets
+                unique_targets, counts = torch.unique(targets_batch, return_counts=True)
+                print(f"  Target token distribution: {dict(zip(unique_targets.cpu().tolist(), counts.cpu().tolist()))}")
 
             # Forward pass
-            loss, _ = model(activations_batch, labels=action_seqs_batch)
+            loss, logits = model(
+                activations_batch,
+                decoder_input=decoder_inputs_batch,
+                labels=targets_batch,
+                attention_mask=attention_masks_batch
+            )
+
+            # Debug: Check loss and logits
+            if epoch == 0 and batch_idx == 0:
+                print(f"  Loss: {loss.item():.4f}")
+                print(f"  Logits shape: {logits.shape}")
+                print(f"  Logits min/max: {logits.min().item():.4f}/{logits.max().item():.4f}")
+                print(f"  Logits has NaN: {torch.isnan(logits).any()}")
+                print(f"  Logits has Inf: {torch.isinf(logits).any()}")
+                # Check predictions
+                preds = torch.argmax(logits, dim=-1)
+                print(f"  Sample predictions[0]: {preds[0].cpu().tolist()}")
+                unique_preds, pred_counts = torch.unique(preds, return_counts=True)
+                print(f"  Prediction token distribution: {dict(zip(unique_preds.cpu().tolist(), pred_counts.cpu().tolist()))}")
 
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            
+            # GRADIENT SCALING: Multiply decoder_layers gradients to combat vanishing gradients
+            # This is more direct than just using higher learning rate
+            gradient_scale_factor = 1000.0  # Scale decoder_layers gradients by 1000x
+            for name, param in model.named_parameters():
+                if "decoder_layers" in name and param.grad is not None:
+                    param.grad.data *= gradient_scale_factor
+            
+            # Debug: Check gradients and trace gradient flow
+            if epoch == 0 and batch_idx == 0:
+                total_grad_norm = 0.0
+                num_params = 0
+                zero_grad_params = []
+                
+                # Check decoder_layers parameters to see if they get gradients
+                print(f"\n  🔍 Checking decoder_layers gradients (with higher precision):")
+                decoder_layer_grads = []
+                for name, param in model.named_parameters():
+                    if "decoder_layers" in name and "0." in name:
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            decoder_layer_grads.append((name, grad_norm))
+                            if len(decoder_layer_grads) <= 3:  # Print first 3
+                                # Use scientific notation to see tiny gradients
+                                print(f"    {name} grad norm: {grad_norm:.2e}")
+                        else:
+                            if len(decoder_layer_grads) == 0:  # Only print once
+                                print(f"    ⚠️  {name} has NO gradient!")
+                if not decoder_layer_grads:
+                    print(f"    ⚠️  CRITICAL: No decoder_layers parameters have gradients!")
+                elif all(g[1] == 0.0 for g in decoder_layer_grads):
+                    print(f"    ⚠️  CRITICAL: All decoder_layers gradients are exactly ZERO!")
+                    print(f"    The regularization on decoder_output should fix this.")
+                
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.data.norm(2)
+                        total_grad_norm += param_grad_norm.item() ** 2
+                        num_params += 1
+                        if "lm_head" in name or "action_embeddings" in name or "decoder_layers.0" in name:
+                            print(f"  {name} grad norm: {param_grad_norm.item():.6f}")
+                            if param_grad_norm.item() == 0.0:
+                                zero_grad_params.append(name)
+                    else:
+                        if "lm_head" in name or "action_embeddings" in name:
+                            print(f"  ⚠️  {name} has NO gradient!")
+                            zero_grad_params.append(name)
+                if zero_grad_params:
+                    print(f"  ⚠️  Parameters with ZERO gradient: {zero_grad_params}")
+                    print(f"  This means these parameters are not being trained!")
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                print(f"  Total gradient norm: {total_grad_norm:.6f}")
+                print(f"  Parameters with gradients: {num_params}/{sum(1 for _ in model.parameters())}")
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
 
             epoch_train_loss += loss.item()
@@ -864,45 +1215,106 @@ def train_decoder_probe(
             sequence_accuracy = 0.0
         else:
             with torch.no_grad():
-                for batch_idx, (activations_batch, action_seqs_batch, seq_lens) in enumerate(eval_loader):
+                for batch_idx, (activations_batch, decoder_inputs_batch, targets_batch, attention_masks_batch) in enumerate(eval_loader):
                     activations_batch = activations_batch.to(device).to(torch.float32)
-                    action_seqs_batch = action_seqs_batch.to(device)
+                    decoder_inputs_batch = decoder_inputs_batch.to(device)
+                    targets_batch = targets_batch.to(device)
+                    attention_masks_batch = attention_masks_batch.to(device)
 
-                    loss, logits = model(activations_batch, labels=action_seqs_batch)
+                    loss, logits = model(
+                        activations_batch,
+                        decoder_input=decoder_inputs_batch,
+                        labels=targets_batch,
+                        attention_mask=attention_masks_batch
+                    )
 
-                    epoch_eval_loss += loss.item()
-                    num_eval_batches += 1
+                    # Debug: Print first eval batch
+                    if batch_idx == 0:
+                        print(f"\n🔍 Debug: First eval batch")
+                        print(f"  Loss: {loss.item():.4f}")
+                        print(f"  Loss is NaN: {torch.isnan(loss)}")
+                        print(f"  Loss is Inf: {torch.isinf(loss)}")
+                        print(f"  Logits shape: {logits.shape}")
+                        print(f"  Logits has NaN: {torch.isnan(logits).any()}")
+                        if torch.isnan(logits).any():
+                            # Find where NaN is
+                            nan_mask = torch.isnan(logits)
+                            print(f"  NaN positions: {nan_mask.sum().item()} out of {logits.numel()}")
+                            # Note: decoder_output is not in scope here, skip this check
+                            pass
+                        print(f"  Logits has Inf: {torch.isinf(logits).any()}")
+                        # Check valid tokens
+                        valid_mask = (targets_batch != PAD_TOKEN_ID) & (targets_batch != EOS_TOKEN_ID)
+                        print(f"  Valid tokens in batch: {valid_mask.sum().item()}/{targets_batch.numel()}")
+                        print(f"  Sample target[0]: {targets_batch[0].cpu().tolist()}")
+                        print(f"  Sample decoder_input[0]: {decoder_inputs_batch[0].cpu().tolist()}")
+                        # Check if action_embeddings are being used
+                        print(f"  action_embeddings.requires_grad: {next(model.action_embeddings.parameters()).requires_grad}")
+
+                    # Check for NaN/Inf before adding to eval loss
+                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                        epoch_eval_loss += loss.item()
+                        num_eval_batches += 1
+                    else:
+                        print(f"Warning: NaN/Inf loss in eval batch {batch_idx}, skipping...")
+                        print(f"  Loss value: {loss.item()}")
+                        print(f"  Logits stats: min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+                        print(f"  Targets stats: min={targets_batch.min().item()}, max={targets_batch.max().item()}")
 
                     # Compute accuracy metrics
                     predictions = torch.argmax(logits, dim=-1)  # (batch_size, seq_len)
 
                     # Token-level accuracy (only count non-padding tokens)
-                    mask = action_seqs_batch != -100
-                    total_tokens += mask.sum().item()
-                    correct_tokens += ((predictions == action_seqs_batch) & mask).sum().item()
+                    # Remove PAD and EOS from target for comparison (compare only actions)
+                    valid_mask = (targets_batch != PAD_TOKEN_ID) & (targets_batch != EOS_TOKEN_ID)
+                    total_tokens += valid_mask.sum().item()
+                    # For predictions, compare actions only (ignore EOS in predictions too)
+                    pred_actions = predictions[valid_mask]
+                    target_actions = targets_batch[valid_mask]
+                    correct_tokens += (pred_actions == target_actions).sum().item()
 
-                    # Sequence-level exact match
+                    # Sequence-level exact match (compare action sequences only, ignoring EOS/PAD)
                     for i in range(predictions.shape[0]):
-                        seq_len = seq_lens[i].item()
-                        if seq_len > 0:
-                            pred_seq = predictions[i, :seq_len].cpu()
-                            true_seq = action_seqs_batch[i, :seq_len].cpu()
-                            if torch.equal(pred_seq, true_seq):
+                        # Get valid actions from target (remove PAD and EOS)
+                        target_seq = targets_batch[i]
+                        valid_target = target_seq[(target_seq != PAD_TOKEN_ID) & (target_seq != EOS_TOKEN_ID)]
+                        
+                        # Get predictions up to EOS or end
+                        pred_seq = predictions[i]
+                        # Find EOS in predictions
+                        eos_idx = (pred_seq == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
+                        if len(eos_idx) > 0:
+                            pred_actions_only = pred_seq[:eos_idx[0]]
+                        else:
+                            # No EOS found, take all non-PAD
+                            pred_actions_only = pred_seq[pred_seq != PAD_TOKEN_ID]
+                        
+                        if len(valid_target) > 0 and len(pred_actions_only) == len(valid_target):
+                            if torch.equal(pred_actions_only.cpu(), valid_target.cpu()):
                                 exact_matches += 1
-                            total_sequences += 1
+                        total_sequences += 1
 
                     # Show sample predictions for first batch of last epoch
                     if epoch == num_epochs - 1 and batch_idx == 0:
                         print("\nSample predictions (first batch):")
                         for i in range(min(3, predictions.shape[0])):
-                            seq_len = seq_lens[i].item()
-                            if seq_len > 0:
-                                pred_seq = predictions[i, :seq_len].cpu().tolist()
-                                true_seq = action_seqs_batch[i, :seq_len].cpu().tolist()
+                            # Get true actions (remove PAD and EOS)
+                            target_seq = targets_batch[i].cpu()
+                            true_actions = target_seq[(target_seq != PAD_TOKEN_ID) & (target_seq != EOS_TOKEN_ID)].tolist()
+                            
+                            # Get predicted actions (remove PAD and EOS)
+                            pred_seq = predictions[i].cpu()
+                            eos_idx = (pred_seq == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
+                            if len(eos_idx) > 0:
+                                pred_actions = pred_seq[:eos_idx[0]].tolist()
+                            else:
+                                pred_actions = pred_seq[pred_seq != PAD_TOKEN_ID].tolist()
+                            
+                            if len(true_actions) > 0 or len(pred_actions) > 0:
                                 print(f"  Sample {i + 1}:")
-                                print(f"    True:  {true_seq}")
-                                print(f"    Pred:  {pred_seq}")
-                                print(f"    Match: {pred_seq == true_seq}")
+                                print(f"    True:  {true_actions}")
+                                print(f"    Pred:  {pred_actions}")
+                                print(f"    Match: {true_actions == pred_actions}")
 
             avg_eval_loss = epoch_eval_loss / num_eval_batches if num_eval_batches > 0 else 0.0
             token_accuracy = correct_tokens / total_tokens if total_tokens > 0 else 0.0
@@ -921,8 +1333,30 @@ def train_decoder_probe(
     # Save model if requested
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+        
+        # Check for NaN in model weights before saving
+        has_nan = False
+        nan_params = []
+        for name, param in model.named_parameters():
+            if torch.isnan(param).any():
+                print(f"Warning: NaN detected in {name} before saving!")
+                has_nan = True
+                nan_params.append(name)
+        if has_nan:
+            print(f"Warning: Model contains NaN weights in {len(nan_params)} parameters! Model may not be usable.")
+            print(f"  Parameters with NaN: {nan_params[:5]}{'...' if len(nan_params) > 5 else ''}")
+        else:
+            print("Model weights checked: No NaN detected.")
+        
         torch.save(model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
+        
+        # Verify the saved model can be loaded
+        try:
+            test_load = torch.load(save_path, map_location='cpu')
+            print(f"Model verification: Successfully loaded {len(test_load)} parameter groups")
+        except Exception as e:
+            print(f"Warning: Could not verify saved model: {e}")
 
     # Compute final accuracy metrics
     model.eval()
@@ -934,27 +1368,43 @@ def train_decoder_probe(
     total_sequences = 0
 
     with torch.no_grad():
-        for activations_batch, action_seqs_batch, seq_lens in eval_loader:
+        for activations_batch, decoder_inputs_batch, targets_batch, attention_masks_batch in eval_loader:
             activations_batch = activations_batch.to(device).to(torch.float32)
-            action_seqs_batch = action_seqs_batch.to(device)
+            decoder_inputs_batch = decoder_inputs_batch.to(device)
+            targets_batch = targets_batch.to(device)
+            attention_masks_batch = attention_masks_batch.to(device)
 
-            _, logits = model(activations_batch, labels=action_seqs_batch)
+            _, logits = model(
+                activations_batch,
+                decoder_input=decoder_inputs_batch,
+                labels=targets_batch,
+                attention_mask=attention_masks_batch
+            )
             predictions = torch.argmax(logits, dim=-1)
 
-            # Token-level accuracy
-            mask = action_seqs_batch != -100
-            total_tokens += mask.sum().item()
-            correct_tokens += ((predictions == action_seqs_batch) & mask).sum().item()
+            # Token-level accuracy (only count actions, ignore PAD and EOS)
+            valid_mask = (targets_batch != PAD_TOKEN_ID) & (targets_batch != EOS_TOKEN_ID)
+            total_tokens += valid_mask.sum().item()
+            pred_actions = predictions[valid_mask]
+            target_actions = targets_batch[valid_mask]
+            correct_tokens += (pred_actions == target_actions).sum().item()
 
             # Sequence-level exact match
             for i in range(predictions.shape[0]):
-                seq_len = seq_lens[i].item()
-                if seq_len > 0:
-                    pred_seq = predictions[i, :seq_len].cpu()
-                    true_seq = action_seqs_batch[i, :seq_len].cpu()
-                    if torch.equal(pred_seq, true_seq):
+                target_seq = targets_batch[i]
+                valid_target = target_seq[(target_seq != PAD_TOKEN_ID) & (target_seq != EOS_TOKEN_ID)]
+                
+                pred_seq = predictions[i]
+                eos_idx = (pred_seq == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
+                if len(eos_idx) > 0:
+                    pred_actions_only = pred_seq[:eos_idx[0]]
+                else:
+                    pred_actions_only = pred_seq[pred_seq != PAD_TOKEN_ID]
+                
+                if len(valid_target) > 0 and len(pred_actions_only) == len(valid_target):
+                    if torch.equal(pred_actions_only.cpu(), valid_target.cpu()):
                         exact_matches += 1
-                    total_sequences += 1
+                total_sequences += 1
 
     final_token_accuracy = correct_tokens / total_tokens if total_tokens > 0 else 0.0
     final_sequence_accuracy = exact_matches / total_sequences if total_sequences > 0 else 0.0

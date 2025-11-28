@@ -130,6 +130,18 @@ def main():
         default=10,
         help="Hard limit on sequence length based on training data stats (default: 10, ~90th percentile)",
     )
+    parser.add_argument(
+        "--n-layer",
+        type=int,
+        default=None,
+        help="Number of decoder layers (inferred from checkpoint if not provided)",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="Max sequence length for position embeddings (inferred from checkpoint if not provided)",
+    )
 
     args = parser.parse_args()
 
@@ -173,13 +185,36 @@ def main():
         else:
             vocab_size = 5
         
-        # Try to infer other params
-        n_layer = 4
-        n_head = 4
-        max_seq_len = 100
+        # Infer n_layer from state_dict (count decoder layers)
+        layer_indices = set()
+        for key in state_dict.keys():
+            if "decoder_layers.layers." in key:
+                # Extract layer index from key like "decoder_layers.layers.0.self_attn.in_proj_weight"
+                parts = key.split(".")
+                for i, part in enumerate(parts):
+                    if part == "layers" and i + 1 < len(parts):
+                        try:
+                            layer_indices.add(int(parts[i + 1]))
+                        except ValueError:
+                            pass
+        n_layer = len(layer_indices) if layer_indices else 4
+        
+        # Infer max_seq_len from position_embeddings.weight shape
+        if "position_embeddings.weight" in state_dict:
+            max_seq_len, _ = state_dict["position_embeddings.weight"].shape
+        else:
+            max_seq_len = 100
+        
+        n_head = 4  # Default, can't easily infer from state_dict
     else:
         raise ValueError("Could not parse model checkpoint. Expected state_dict or dict with 'model_state_dict'")
 
+    # Override with command-line arguments if provided
+    if args.n_layer is not None:
+        n_layer = args.n_layer
+    if args.max_seq_len is not None:
+        max_seq_len = args.max_seq_len
+    
     print(f"Model parameters:")
     print(f"  Activation dim: {activation_dim}")
     print(f"  Vocab size: {vocab_size}")
@@ -372,7 +407,7 @@ def main():
             print(f"  Layer: {args.layer}")
             activations = load_activations_from_hf(
                 repo_id=args.hf_repo_id,
-                path_in_repo=f"activations/{args.activations_dir}",
+                path_in_repo=args.activations_dir,  # Don't add extra "activations/" prefix
                 layer=args.layer,
                 grid_indices=args.env_indices,
             )
@@ -470,26 +505,30 @@ def main():
             actions_list = actions[0].cpu().tolist()
             actions_list = [a for a in actions_list if a != -100]  # Remove padding
             
-            action_names = ["LEFT", "RIGHT", "UP", "DOWN"]  # 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN
-            pred_seq_str = " → ".join([action_names[a] for a in actions_list])
+            action_names = ["LEFT", "RIGHT", "UP", "DOWN", "SOS", "EOS", "PAD"]  # 0-3=actions, 4=SOS, 5=EOS, 6=PAD
+            # Filter to only valid actions (0-3) for display
+            valid_actions = [a for a in actions_list if 0 <= a <= 3]
+            pred_seq_str = " → ".join([action_names[a] for a in valid_actions]) if valid_actions else "(no valid actions)"
             
-            print(f"🤖 Prediction ({len(actions_list)} actions): {actions_list}")
+            # Filter to only valid actions for display
+            valid_actions = [a for a in actions_list if 0 <= a <= 3]
+            print(f"🤖 Prediction ({len(valid_actions)} actions): {valid_actions}")
             print(f"   {pred_seq_str}")
             
             # Compare with ground truth if available
             if true_actions is not None:
-                # Compare sequences
-                min_len = min(len(actions_list), len(true_actions))
-                matches = sum(1 for i in range(min_len) if actions_list[i] == true_actions[i])
+                # Compare sequences using valid_actions (filtered to 0-3 only)
+                min_len = min(len(valid_actions), len(true_actions))
+                matches = sum(1 for i in range(min_len) if valid_actions[i] == true_actions[i])
                 accuracy = matches / len(true_actions) if len(true_actions) > 0 else 0.0
-                exact_match = (len(actions_list) == len(true_actions) and 
-                              all(actions_list[i] == true_actions[i] for i in range(len(true_actions))))
+                exact_match = (len(valid_actions) == len(true_actions) and 
+                              all(valid_actions[i] == true_actions[i] for i in range(len(true_actions))))
                 
                 print(f"\n📊 Comparison:")
                 print(f"   Token accuracy: {matches}/{len(true_actions)} ({accuracy*100:.1f}%)")
                 print(f"   Exact match: {'✅ YES' if exact_match else '❌ NO'}")
-                if not exact_match and len(actions_list) != len(true_actions):
-                    print(f"   Length: predicted={len(actions_list)}, ground_truth={len(true_actions)}")
+                if not exact_match and len(valid_actions) != len(true_actions):
+                    print(f"   Length: predicted={len(valid_actions)}, ground_truth={len(true_actions)}")
     else:
         print("Error: Must provide one of:")
         print("  1. --activation-path (single activation file)")

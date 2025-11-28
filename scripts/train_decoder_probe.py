@@ -66,8 +66,8 @@ def main():
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=5,
-        help="Action vocabulary size (default: 5 for 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=EOS)",
+        default=7,
+        help="Vocabulary size (default: 7 for 0-3=actions, 4=SOS, 5=EOS, 6=PAD)",
     )
     parser.add_argument(
         "--add-eos-token",
@@ -150,11 +150,34 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to train on (default: cuda if available, else cpu)",
+        default=None,
+        help="Device to train on (default: auto-detect: mps for macOS, cuda if available, else cpu). Use 'cpu' if you get CUDA errors.",
     )
 
     args = parser.parse_args()
+    
+    # Auto-detect device if not specified
+    if args.device is None:
+        # Try MPS first (macOS Metal)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            args.device = "mps"
+        # Try CUDA, but catch errors if it's not actually available
+        elif torch.cuda.is_available():
+            try:
+                # Test if CUDA actually works
+                test_tensor = torch.tensor([1.0]).cuda()
+                args.device = "cuda"
+            except (AssertionError, RuntimeError):
+                # CUDA not actually available despite is_available() returning True
+                args.device = "cpu"
+        else:
+            args.device = "cpu"
+    
+    # Safety check: if device is "cuda" but we're on macOS, force CPU
+    import platform
+    if args.device == "cuda" and platform.system() == "Darwin":
+        print("Warning: CUDA not available on macOS. Using CPU instead.")
+        args.device = "cpu"
 
     print("=" * 60)
     print("Training Decoder Probe")
@@ -176,21 +199,25 @@ def main():
 
     # Step 2: Load action sequences from training CSV
     print("\n📥 Step 2: Loading action sequences from training CSV...")
-    action_sequences = load_action_sequences_from_csv(
+    decoder_inputs, targets = load_action_sequences_from_csv(
         csv_path=args.train_csv,
         max_seq_len=args.max_seq_len,
         add_eos_token=args.add_eos_token,
     )
-    print(f"Loaded {len(action_sequences)} action sequences")
+    print(f"Loaded {len(decoder_inputs)} decoder inputs and {len(targets)} targets")
 
     # Step 3: Create training dataset
     print("\n🔗 Step 3: Creating training dataset...")
-    train_dataset = create_dataset(activations, action_sequences, max_seq_len=args.max_seq_len, vocab_size=args.vocab_size)
+    train_dataset = create_dataset(activations, decoder_inputs, targets, max_seq_len=args.max_seq_len)
     print(f"Created {len(train_dataset)} training pairs")
 
     # Step 4: Handle validation/test sets
     val_dataset = None
     test_dataset = None
+    val_decoder_inputs = None
+    val_targets = None
+    test_decoder_inputs = None
+    test_targets = None
 
     if args.val_csv:
         print("\n📥 Loading validation activations and sequences...")
@@ -200,12 +227,12 @@ def main():
             layer=args.layer,
             hf_repo_id=args.hf_repo_id,
         )
-        val_action_sequences = load_action_sequences_from_csv(
+        val_decoder_inputs, val_targets = load_action_sequences_from_csv(
             csv_path=args.val_csv,
             max_seq_len=args.max_seq_len,
             add_eos_token=args.add_eos_token,
         )
-        val_dataset = create_dataset(val_activations, val_action_sequences, max_seq_len=args.max_seq_len, vocab_size=args.vocab_size)
+        val_dataset = create_dataset(val_activations, val_decoder_inputs, val_targets, max_seq_len=args.max_seq_len)
         print(f"Created {len(val_dataset)} validation pairs")
 
     if args.test_csv:
@@ -216,21 +243,43 @@ def main():
             layer=args.layer,
             hf_repo_id=args.hf_repo_id,
         )
-        test_action_sequences = load_action_sequences_from_csv(
+        test_decoder_inputs, test_targets = load_action_sequences_from_csv(
             csv_path=args.test_csv,
             max_seq_len=args.max_seq_len,
             add_eos_token=args.add_eos_token,
         )
-        test_dataset = create_dataset(test_activations, test_action_sequences, max_seq_len=args.max_seq_len, vocab_size=args.vocab_size)
+        test_dataset = create_dataset(test_activations, test_decoder_inputs, test_targets, max_seq_len=args.max_seq_len)
         print(f"Created {len(test_dataset)} test pairs")
 
-    # Step 5: Determine activation dimension
+    # Step 5: Determine activation dimension and calculate max sequence length
     if len(train_dataset) == 0:
         raise ValueError("No training data! Check that activations and action sequences match.")
     
-    sample_activation, _ = train_dataset[0]
+    sample_activation, _, _ = train_dataset[0]
     activation_dim = sample_activation.shape[0]
     print(f"\n📊 Activation dimension: {activation_dim}")
+    
+    # Calculate max sequence length from all datasets (train, val, test)
+    # This ensures consistent padding across all splits
+    all_decoder_inputs = list(decoder_inputs.values())
+    all_targets = list(targets.values())
+    if val_decoder_inputs:
+        all_decoder_inputs.extend(list(val_decoder_inputs.values()))
+        all_targets.extend(list(val_targets.values()))
+    if test_decoder_inputs:
+        all_decoder_inputs.extend(list(test_decoder_inputs.values()))
+        all_targets.extend(list(test_targets.values()))
+    
+    max_decoder_input_len = max(len(seq) for seq in all_decoder_inputs) if all_decoder_inputs else 100
+    max_target_len = max(len(seq) for seq in all_targets) if all_targets else 100
+    global_max_seq_len = max(max_decoder_input_len, max_target_len)
+    # Cap at model's max_seq_len
+    effective_max_seq_len = min(global_max_seq_len, args.max_seq_len)
+    print(f"\n📏 Max sequence lengths:")
+    print(f"  Decoder input: {max_decoder_input_len}")
+    print(f"  Target: {max_target_len}")
+    print(f"  Global max: {global_max_seq_len}")
+    print(f"  Effective max (capped at model limit): {effective_max_seq_len}")
 
     # Step 6: Create model
     print("\n🏗️  Step 4: Creating decoder probe model...")
@@ -263,6 +312,8 @@ def main():
         eval_split=args.eval_split if not args.val_csv else 0.0,  # Use 0 if we have separate val set
         val_dataset=val_dataset,  # Pass separate validation set if available
         save_path=args.save_path,
+        max_decoder_input_len=max_decoder_input_len,  # Pass max lengths from all datasets
+        max_target_len=max_target_len,
     )
 
     print("\n" + "=" * 60)
@@ -276,38 +327,61 @@ def main():
     if test_dataset and len(test_dataset) > 0:
         print("\n🧪 Step 6: Evaluating on test set...")
         from torch.utils.data import DataLoader
+        from telos_interp.decoder_probe import PAD_TOKEN_ID, EOS_TOKEN_ID
 
         model.eval()
         
-        # Use the same collate function as training
-        dataset_max_len = max(len(seq) for _, seq in test_dataset) if test_dataset else 100
-        effective_max_len = min(dataset_max_len, args.max_seq_len - 1)  # Account for position embedding limit
+        # Use the same collate function as training (from train_decoder_probe)
+        all_data = test_dataset
+        max_decoder_input_len = max(len(decoder_input) for _, decoder_input, _ in all_data) if all_data else 100
+        max_target_len = max(len(target) for _, _, target in all_data) if all_data else 100
+        effective_max_decoder_len = min(max_decoder_input_len, args.max_seq_len)
+        effective_max_target_len = min(max_target_len, args.max_seq_len)
         
         def test_collate_fn(batch):
             activations = []
-            action_seqs = []
-            seq_lens = []
+            decoder_inputs = []
+            targets = []
+            attention_masks = []
 
-            for activation, action_seq in batch:
+            for activation, decoder_input, target in batch:
                 activations.append(activation)
-                # Truncate if longer than model's max_seq_len - 1
-                if len(action_seq) > args.max_seq_len - 1:
-                    action_seq = action_seq[:args.max_seq_len - 1]
-                seq_lens.append(len(action_seq))
-                # Pad sequence to effective_max_len
-                if len(action_seq) < effective_max_len:
-                    padded_seq = torch.cat(
-                        [action_seq, torch.full((effective_max_len - len(action_seq),), -100, dtype=torch.long)]
+                
+                # Truncate if longer than max_seq_len
+                if len(decoder_input) > args.max_seq_len:
+                    decoder_input = decoder_input[:args.max_seq_len]
+                if len(target) > args.max_seq_len:
+                    target = target[:args.max_seq_len]
+                
+                # Pad with PAD tokens
+                if len(decoder_input) < effective_max_decoder_len:
+                    padding = torch.full(
+                        (effective_max_decoder_len - len(decoder_input),), 
+                        PAD_TOKEN_ID, 
+                        dtype=torch.long
                     )
-                else:
-                    padded_seq = action_seq
-                # Ensure all action values are in valid range [0, vocab_size-1] (ignore padding -100)
-                padded_seq = torch.where(padded_seq == -100, padded_seq, torch.clamp(padded_seq, 0, args.vocab_size - 1))
-                action_seqs.append(padded_seq)
+                    decoder_input = torch.cat([decoder_input, padding])
+                
+                if len(target) < effective_max_target_len:
+                    padding = torch.full(
+                        (effective_max_target_len - len(target),), 
+                        PAD_TOKEN_ID, 
+                        dtype=torch.long
+                    )
+                    target = torch.cat([target, padding])
+                
+                attention_mask = (decoder_input != PAD_TOKEN_ID).long()
+                
+                decoder_inputs.append(decoder_input)
+                targets.append(target)
+                attention_masks.append(attention_mask)
 
             activations_tensor = torch.stack(activations)
-            action_seqs_tensor = torch.stack(action_seqs)
-            return activations_tensor, action_seqs_tensor, torch.tensor(seq_lens)
+            decoder_inputs_tensor = torch.stack(decoder_inputs)
+            targets_tensor = torch.stack(targets)
+            attention_masks_tensor = torch.stack(attention_masks)
+            
+            return activations_tensor, decoder_inputs_tensor, targets_tensor, attention_masks_tensor
         
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=test_collate_fn)
 
@@ -317,61 +391,47 @@ def main():
         total_sequences = 0
 
         with torch.no_grad():
-            for activation_batch, action_seq_batch, seq_lens in test_loader:
+            for activation_batch, decoder_inputs_batch, targets_batch, attention_masks_batch in test_loader:
                 activation_batch = activation_batch.to(args.device).to(torch.float32)
-                action_seq_batch = action_seq_batch.to(args.device)
+                decoder_inputs_batch = decoder_inputs_batch.to(args.device)
+                targets_batch = targets_batch.to(args.device)
+                attention_masks_batch = attention_masks_batch.to(args.device)
 
                 # Generate predictions
-                predictions = model.generate(activation_batch, max_length=args.max_seq_len - 1)
+                predictions = model.generate(activation_batch, max_length=args.max_seq_len)
                 
-                # Compare with ground truth using actual sequence lengths
+                # Compare with ground truth
                 for i in range(predictions.shape[0]):
-                    seq_len = seq_lens[i].item()
-                    if seq_len > 0:
-                        # Get true sequence (includes EOS token at the end if add_eos_token was True)
-                        true_seq_full = action_seq_batch[i, :seq_len].cpu()
+                    # Get target sequence (actions + EOS, with PAD)
+                    target_seq = targets_batch[i].cpu()
+                    
+                    # Remove PAD and EOS from target to get true actions
+                    true_actions = target_seq[(target_seq != PAD_TOKEN_ID) & (target_seq != EOS_TOKEN_ID)]
+                    
+                    # Get prediction sequence (EOS already removed by generate())
+                    pred_seq = predictions[i].cpu()
+                    
+                    # Remove PAD from predictions
+                    pred_actions = pred_seq[pred_seq != PAD_TOKEN_ID]
+                    
+                    # Compare up to minimum length
+                    min_len = min(len(true_actions), len(pred_actions))
+                    if min_len > 0:
+                        true_seq_compare = true_actions[:min_len]
+                        pred_seq_compare = pred_actions[:min_len]
                         
-                        # Remove EOS token from true sequence for comparison
-                        # (since generate() removes EOS from predictions)
-                        eos_mask = (true_seq_full == EOS_TOKEN_ID)
-                        if eos_mask.any():
-                            # Find first EOS and truncate before it
-                            eos_indices = eos_mask.nonzero(as_tuple=True)[0]
-                            if len(eos_indices) > 0:
-                                true_seq = true_seq_full[:eos_indices[0]]
-                            else:
-                                true_seq = true_seq_full
-                        else:
-                            true_seq = true_seq_full
+                        # Token-level accuracy
+                        total_tokens += min_len
+                        correct_tokens += (pred_seq_compare == true_seq_compare).sum().item()
                         
-                        # Get prediction sequence (EOS already removed by generate())
-                        pred_seq = predictions[i].cpu()  # Get full prediction
-                        
-                        # Remove padding from both sequences
-                        true_mask = true_seq != -100
-                        pred_mask = pred_seq != -100
-                        
-                        true_seq_valid = true_seq[true_mask]
-                        pred_seq_valid = pred_seq[pred_mask]
-                        
-                        # Compare up to minimum length
-                        min_len = min(len(true_seq_valid), len(pred_seq_valid))
-                        if min_len > 0:
-                            true_seq_compare = true_seq_valid[:min_len]
-                            pred_seq_compare = pred_seq_valid[:min_len]
-                            
-                            # Token-level accuracy
-                            total_tokens += min_len
-                            correct_tokens += (pred_seq_compare == true_seq_compare).sum().item()
-                            
-                            # Sequence-level exact match (only if full sequences match)
-                            if len(true_seq_valid) == len(pred_seq_valid):
-                                if torch.equal(true_seq_valid, pred_seq_valid):
-                                    exact_matches += 1
-                            total_sequences += 1
-                        elif len(true_seq_valid) > 0:
-                            # Prediction is empty but true sequence has actions
-                            total_sequences += 1
+                        # Sequence-level exact match (only if full sequences match)
+                        if len(true_actions) == len(pred_actions):
+                            if torch.equal(true_actions, pred_actions):
+                                exact_matches += 1
+                        total_sequences += 1
+                    elif len(true_actions) > 0:
+                        # Prediction is empty but true sequence has actions
+                        total_sequences += 1
 
         test_token_acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
         test_seq_acc = exact_matches / total_sequences if total_sequences > 0 else 0.0
