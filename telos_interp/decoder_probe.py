@@ -58,9 +58,17 @@ class ActionDecoderProbe(nn.Module):
         self.activation_dim = activation_dim
         self.n_embd = n_embd
         self.eos_loss_weight_threshold = eos_loss_weight_threshold
-
-        # Project activation to decoder embedding dimension
-        self.activation_projection = nn.Linear(activation_dim, n_embd)
+        
+        # If n_embd == activation_dim, use identity (no projection)
+        # This preserves the original activation exactly
+        self.use_identity_projection = (n_embd == activation_dim)
+        
+        if self.use_identity_projection:
+            # No projection - use activation directly
+            self.activation_projection = nn.Identity()
+        else:
+            # Project activation to decoder embedding dimension
+            self.activation_projection = nn.Linear(activation_dim, n_embd)
 
         # Action token embeddings
         self.action_embeddings = nn.Embedding(vocab_size, n_embd)
@@ -86,10 +94,13 @@ class ActionDecoderProbe(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with small random values."""
-        nn.init.normal_(self.activation_projection.weight, std=0.02)
-        nn.init.normal_(self.activation_projection.bias, std=0.02)
-        nn.init.normal_(self.action_embeddings.weight, std=0.02)
+        """Initialize weights for stronger forward pass signal."""
+        # Using larger std (0.1) instead of GPT-2 default (0.02) 
+        # to ensure stronger signal through the network
+        if not self.use_identity_projection:
+            nn.init.normal_(self.activation_projection.weight, std=0.1)
+            nn.init.normal_(self.activation_projection.bias, std=0.01)
+        nn.init.normal_(self.action_embeddings.weight, std=0.1)
 
     def forward(
         self,
