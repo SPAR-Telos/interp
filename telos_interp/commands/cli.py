@@ -6,7 +6,15 @@ import nnsight
 import pandas as pd
 import torch
 import typer
-from telos_interp import activations, cellwise_activations, data_generation, probing, probing_gpu, steering
+from telos_interp import (
+    activations,
+    cellwise_activations,
+    data_generation,
+    decoder_probe,
+    probing,
+    probing_gpu,
+    steering,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -111,6 +119,35 @@ def gather_full_activations_from_jsonl(
 
     typer.echo(f"Full activations saved to {results_path}")
     typer.echo(f"HF path: {hf_path}")
+
+
+@app.command("gather-full-prompt-acts-csv", help="Gather activations for all tokens in fo_prompt from a CSV file")
+def gather_full_prompt_activations_from_csv(
+    model_name_or_path: str,
+    csv_path: str,
+    layers: Annotated[str, typer.Option(help="Comma-separated list of layer numbers, or single layer number")],
+    unique_envs_only: Annotated[bool, typer.Option(help="Only process one row per unique env_idx")] = True,
+):
+    """Gather activations for all tokens in fo_prompt for each grid in a CSV file.
+    
+    This extracts activations for all tokens in the prompt (up to the last token of the prompt)
+    for each grid. It uses only the fo_prompt column and ignores other details like fo_cell_types.
+    """
+    # Parse layers - can be single int or comma-separated list
+    try:
+        if "," in layers:
+            layers_list = parse_list_of_integers(layers)
+        else:
+            layers_list = int(layers)
+    except ValueError:
+        typer.echo(f"Error: Invalid layers format '{layers}'. Use a single integer or comma-separated list.")
+        raise typer.Exit(1)
+    
+    results_path = activations.gather_full_prompt_activations_from_csv(
+        model_name_or_path, csv_path, layers_list, unique_envs_only
+    )
+
+    typer.echo(f"Full prompt activations saved to {results_path}")
 
 
 @app.command("train-multiclass-probe", help="Train a multi-class probing classifier on grid cell activations")
@@ -416,6 +453,101 @@ def steer_interactive(
             typer.echo(f"Response: {response}\n")
         except Exception as e:
             typer.echo(f"Error: {e}\n")
+
+
+@app.command("train-decoder-probe", help="Train a decoder probe to predict action sequences from LLM activations.")
+def train_decoder_probe_cmd(
+    csv_path: Annotated[str, typer.Argument(..., help="Path to CSV file with trajectory/action data")],
+    hf_repo_id: Annotated[str, typer.Option(help="Hugging Face repository ID")] = "project-telos/interp",
+    hf_path: Annotated[str, typer.Option(help="Path within HF repo to activations")] = "first_six_hundred_grids",
+    layer: Annotated[int, typer.Option(help="Layer number to use from activations")] = 12,
+    activation_dim: Annotated[
+        int, typer.Option(help="Dimension of activation vectors (auto-detected if not provided)")
+    ] = None,
+    vocab_size: Annotated[int, typer.Option(help="Number of action tokens")] = 4,
+    n_layer: Annotated[int, typer.Option(help="Number of decoder layers")] = 4,
+    n_head: Annotated[int, typer.Option(help="Number of attention heads")] = 4,
+    n_embd: Annotated[int, typer.Option(help="Decoder embedding dimension")] = 256,
+    max_seq_len: Annotated[int, typer.Option(help="Maximum action sequence length")] = 100,
+    batch_size: Annotated[int, typer.Option(help="Batch size for training")] = 32,
+    num_epochs: Annotated[int, typer.Option(help="Number of training epochs")] = 10,
+    learning_rate: Annotated[float, typer.Option(help="Learning rate")] = 1e-4,
+    eval_split: Annotated[float, typer.Option(help="Fraction of data for evaluation")] = 0.2,
+    save_path: Annotated[str, typer.Option(help="Path to save trained model")] = None,
+    device: Annotated[str, typer.Option(help="Device to train on (cuda/cpu, auto-detected if not provided)")] = None,
+):
+    """Train a decoder probe to predict action sequences from LLM activations."""
+    print("Loading activations from Hugging Face...")
+    activations_dict = decoder_probe.load_activations_from_hf(repo_id=hf_repo_id, path_in_repo=hf_path, layer=layer)
+
+    if len(activations_dict) == 0:
+        typer.echo("Error: No activations loaded from Hugging Face repository", err=True)
+        raise typer.Exit(1)
+
+    print(f"Loaded {len(activations_dict)} activations")
+
+    # Determine activation dimension if not provided
+    if activation_dim is None:
+        sample_activation = next(iter(activations_dict.values()))
+        activation_dim = sample_activation.shape[-1]
+        print(f"Detected activation dimension: {activation_dim}")
+
+    print("Loading action sequences from CSV...")
+    action_sequences = decoder_probe.load_action_sequences_from_csv(csv_path, max_seq_len=max_seq_len)
+
+    if len(action_sequences) == 0:
+        typer.echo("Error: No action sequences loaded from CSV", err=True)
+        raise typer.Exit(1)
+
+    print(f"Loaded {len(action_sequences)} action sequences")
+
+    print("Creating dataset...")
+    dataset = decoder_probe.create_dataset(activations_dict, action_sequences, max_seq_len=max_seq_len)
+
+    if len(dataset) == 0:
+        typer.echo("Error: No matching grid indices between activations and action sequences", err=True)
+        raise typer.Exit(1)
+
+    print(f"Created dataset with {len(dataset)} samples")
+
+    # Create model
+    print("Initializing decoder probe model...")
+    model = decoder_probe.ActionDecoderProbe(
+        activation_dim=activation_dim,
+        vocab_size=vocab_size,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        max_seq_len=max_seq_len,
+    )
+
+    # Determine device
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Train model
+    print("Starting training...")
+    metrics = decoder_probe.train_decoder_probe(
+        model=model,
+        dataset=dataset,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        learning_rate=learning_rate,
+        device=device,
+        eval_split=eval_split,
+        save_path=save_path,
+    )
+
+    print("\nTraining completed!")
+    print(f"Final train loss: {metrics['final_train_loss']:.4f}")
+    print(f"Final eval loss: {metrics['final_eval_loss']:.4f}")
+    print(
+        f"Final token accuracy: {metrics['final_token_accuracy']:.4f} ({metrics['final_token_accuracy'] * 100:.2f}%)"
+    )
+    print(
+        f"Final sequence accuracy: {metrics['final_sequence_accuracy']:.4f} ({metrics['final_sequence_accuracy'] * 100:.2f}%)"
+    )
 
 
 if __name__ == "__main__":
