@@ -321,8 +321,8 @@ def main():
     print("\n" + "=" * 60)
     print("Training Complete!")
     print("=" * 60)
-    print(f"Final Token Accuracy: {metrics['final_token_accuracy']:.4f}")
-    print(f"Final Sequence Accuracy: {metrics['final_sequence_accuracy']:.4f}")
+    print(f"Final Sequence Accuracy: {metrics['final_sequence_accuracy']:.4f} ⭐ (PRIMARY METRIC)")
+    print(f"Final Token Accuracy: {metrics['final_token_accuracy']:.4f} (misleading, 25% random baseline)")
     print(f"Model saved to: {args.save_path}")
 
     # Step 8: Evaluate on test set if provided
@@ -392,12 +392,16 @@ def main():
         exact_matches = 0
         total_sequences = 0
 
+        # Use the actual device the model is on (may have fallen back to CPU)
+        actual_device = next(model.parameters()).device
+        print(f"Using device: {actual_device} for test evaluation")
+        
         with torch.no_grad():
             for activation_batch, decoder_inputs_batch, targets_batch, attention_masks_batch in test_loader:
-                activation_batch = activation_batch.to(args.device).to(torch.float32)
-                decoder_inputs_batch = decoder_inputs_batch.to(args.device)
-                targets_batch = targets_batch.to(args.device)
-                attention_masks_batch = attention_masks_batch.to(args.device)
+                activation_batch = activation_batch.to(actual_device).to(torch.float32)
+                decoder_inputs_batch = decoder_inputs_batch.to(actual_device)
+                targets_batch = targets_batch.to(actual_device)
+                attention_masks_batch = attention_masks_batch.to(actual_device)
 
                 # Generate predictions
                 predictions = model.generate(activation_batch, max_length=args.max_seq_len)
@@ -438,8 +442,8 @@ def main():
         test_token_acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
         test_seq_acc = exact_matches / total_sequences if total_sequences > 0 else 0.0
 
-        print(f"Test Token Accuracy: {test_token_acc:.4f}")
-        print(f"Test Sequence Accuracy: {test_seq_acc:.4f}")
+        print(f"Test Sequence Accuracy: {test_seq_acc:.4f} ⭐ (PRIMARY METRIC)")
+        print(f"Test Token Accuracy: {test_token_acc:.4f} (misleading, 25% random baseline)")
 
 
 if __name__ == "__main__":

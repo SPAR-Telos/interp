@@ -335,7 +335,35 @@ class ActionDecoderProbe(nn.Module):
                 masked_loss = weighted_loss.masked_fill(~pad_mask_2d, 0.0)
                 # Sum over ALL positions (masked positions are zero, so they don't contribute to loss)
                 # But gradients still flow through them to maintain the computation graph
-                main_loss = masked_loss.sum() / num_valid.clamp(min=1)
+                token_level_loss = masked_loss.sum() / num_valid.clamp(min=1)
+                
+                # SEQUENCE-LEVEL LOSS: Compute negative log probability of correct sequences
+                # This directly optimizes for sequence accuracy, not just token accuracy
+                # For each sequence, compute P(correct_sequence) and maximize it
+                # Vectorized computation to maintain gradients
+                log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, seq_len, vocab_size)
+                
+                # Gather log probabilities of correct tokens: log_probs[b, pos, labels[b, pos]]
+                # Use gather to select the correct token's log prob at each position
+                labels_expanded = labels_2d.unsqueeze(-1)  # (batch_size, seq_len, 1)
+                correct_token_log_probs = log_probs.gather(dim=-1, index=labels_expanded).squeeze(-1)  # (batch_size, seq_len)
+                
+                # Mask out PAD tokens and sum to get log probability of each correct sequence
+                masked_log_probs = correct_token_log_probs * pad_mask_2d.float()  # (batch_size, seq_len)
+                seq_log_probs = masked_log_probs.sum(dim=1)  # (batch_size,) - sum of log probs for each sequence
+                
+                # Normalize by sequence length (number of valid tokens) to make comparable
+                seq_lengths = pad_mask_2d.sum(dim=1).float()  # (batch_size,)
+                seq_lengths = seq_lengths.clamp(min=1.0)  # Avoid division by zero
+                normalized_seq_log_probs = seq_log_probs / seq_lengths  # (batch_size,)
+                
+                # Negative log-likelihood (we want to minimize this, so maximize likelihood)
+                sequence_level_loss = -normalized_seq_log_probs.mean()  # Average across batch
+                
+                # Combine token-level and sequence-level losses
+                # Sequence accuracy is what matters - token accuracy is misleading (25% random baseline)
+                # Keep tiny token loss (5%) only for gradient flow, but sequence loss (95%) is primary
+                main_loss = 0.05 * token_level_loss + 0.95 * sequence_level_loss
                 
                 # CRITICAL FIX: Add regularization to ensure gradients flow to all layers
                 # The main loss gradient is very small for decoder_layers (1e-8) because:
@@ -679,8 +707,17 @@ def load_activations_from_hf(
                 f"Found {len(grid_indices)} environments with layer_{layer} activations: {grid_indices[:20]}{'...' if len(grid_indices) > 20 else ''}"
             )
         except Exception as e:
-            print(f"Warning: Could not list repository files: {e}")
-            print("Falling back to trying env indices 1-2400...")
+            error_str = str(e)
+            if "404" in error_str or "Not Found" in error_str or "RepositoryNotFoundError" in str(type(e).__name__):
+                print(f"⚠️  Warning: Could not access repository '{repo_id}': {error_str}")
+                print("   This usually means:")
+                print("   1. The repository is private and requires authentication")
+                print("   2. Run: huggingface-cli login")
+                print("   3. Or the repository doesn't exist at this path")
+                print("   Falling back to trying env indices 1-2400 (this will be slower)...")
+            else:
+                print(f"Warning: Could not list repository files: {e}")
+                print("Falling back to trying env indices 1-2400...")
             grid_indices = list(range(1, 2401))
 
     print(f"Loading activations for {len(grid_indices)} environments...")
@@ -703,9 +740,22 @@ def load_activations_from_hf(
             activations[env_idx] = activation
             loaded += 1
         except Exception as e:
-            # Only print warnings for non-404 errors (404s are expected for missing grids)
-            if "404" not in str(e) and "Not Found" not in str(e):
-                print(f"Warning: Could not load activations for env_{env_idx}: {e}")
+            error_str = str(e)
+            # 404s are expected for missing grids, but if we get many 404s at the start, it might be auth issue
+            if "404" in error_str or "Not Found" in error_str:
+                # Only print first few 404s to avoid spam
+                if loaded == 0 and env_idx <= 5:
+                    print(f"  env_{env_idx}: Not found (404) - this is normal if file doesn't exist")
+                # If we've tried many and got all 404s, might be auth issue
+                if env_idx == 10 and loaded == 0:
+                    print(f"  ⚠️  Warning: All first 10 files returned 404. This might indicate:")
+                    print(f"     - Authentication needed (run: huggingface-cli login)")
+                    print(f"     - Wrong repository path")
+                    print(f"     - Files don't exist at these indices")
+            else:
+                # Non-404 errors are more serious
+                if loaded == 0 or env_idx <= 5:
+                    print(f"Warning: Could not load activations for env_{env_idx}: {e}")
             continue
 
     print(f"Successfully loaded {loaded}/{len(grid_indices)} activations")
@@ -1018,7 +1068,20 @@ def train_decoder_probe(
 
     from torch.utils.data import DataLoader
 
-    model = model.to(device)
+    # Try to move model to device, with fallback to CPU if CUDA fails
+    try:
+        model = model.to(device)
+        # Test if CUDA actually works by creating a test tensor
+        if device == "cuda":
+            test_tensor = torch.tensor([1.0]).to(device)
+    except RuntimeError as e:
+        if "cuda" in str(e).lower() or "CUDA" in str(e):
+            print(f"⚠️  Warning: CUDA initialization failed: {e}")
+            print("   Falling back to CPU. Training will be slower but will work.")
+            device = "cpu"
+            model = model.to(device)
+        else:
+            raise
 
     # Use provided validation dataset or split training dataset
     if val_dataset is not None:
@@ -1349,8 +1412,8 @@ def train_decoder_probe(
             f"Epoch {epoch + 1}/{num_epochs}: "
             f"Train Loss: {avg_train_loss:.4f}, "
             f"Eval Loss: {avg_eval_loss:.4f}, "
-            f"Token Acc: {token_accuracy:.4f}, "
-            f"Seq Acc: {sequence_accuracy:.4f}"
+            f"Seq Acc: {sequence_accuracy:.4f} (PRIMARY) | "
+            f"Token Acc: {token_accuracy:.4f} (misleading, 25% random baseline)"
         )
 
     # Save model if requested

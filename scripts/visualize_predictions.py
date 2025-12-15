@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 import torch
@@ -28,7 +29,6 @@ sys.path.insert(0, str(project_root))
 from telos_interp.decoder_probe import (
     EOS_TOKEN_ID,
     ActionDecoderProbe,
-    load_activations_from_hf,
     load_activations_from_local,
 )
 
@@ -110,41 +110,90 @@ def load_model(model_path, device):
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
         activation_dim = checkpoint.get("activation_dim", 2880)
-        vocab_size = checkpoint.get("vocab_size", 5)
-        n_layer = checkpoint.get("n_layer", 4)
+        vocab_size = checkpoint.get("vocab_size", 7)
+        n_layer = checkpoint.get("n_layer", 2)
         n_head = checkpoint.get("n_head", 4)
-        n_embd = checkpoint.get("n_embd", 256)
-        max_seq_len = checkpoint.get("max_seq_len", 100)
+        num_memory_tokens = checkpoint.get("num_memory_tokens", 8)
+        max_seq_len = checkpoint.get("max_seq_len", 15)
     else:
         state_dict = checkpoint
-        if "activation_projection.weight" in state_dict:
-            n_embd, activation_dim = state_dict["activation_projection.weight"].shape
-        else:
-            activation_dim = 2880
-            n_embd = 256
-        
+        # Infer parameters from state dict
         if "action_embeddings.weight" in state_dict:
-            vocab_size, _ = state_dict["action_embeddings.weight"].shape
+            vocab_size, memory_token_dim = state_dict["action_embeddings.weight"].shape
         else:
-            vocab_size = 5
+            vocab_size = 7
+            memory_token_dim = 360  # Default: 2880 / 8
         
-        n_layer = 4
-        n_head = 4
-        max_seq_len = 100
+        # Infer activation_dim and num_memory_tokens
+        # Check decoder_layers to see the expected input dimension
+        if "decoder_layers.layers.0.self_attn.in_proj_weight" in state_dict:
+            # in_proj_weight shape is (3 * d_model, d_model) for query, key, value
+            in_proj_dim = state_dict["decoder_layers.layers.0.self_attn.in_proj_weight"].shape[0] // 3
+            memory_token_dim = in_proj_dim
+        
+        # Try to infer num_memory_tokens from activation_dim
+        # Common values: 2880 / 8 = 360, 2880 / 4 = 720, etc.
+        activation_dim = 2880  # Default
+        num_memory_tokens = 8  # Default
+        
+        # Try to infer from position_embeddings (max_seq_len)
+        if "position_embeddings.weight" in state_dict:
+            max_seq_len, pos_dim = state_dict["position_embeddings.weight"].shape
+            if pos_dim != memory_token_dim:
+                memory_token_dim = pos_dim
+        else:
+            max_seq_len = 15  # Default from training
+        
+        # Infer num_memory_tokens: activation_dim must be divisible by num_memory_tokens
+        # Try common values
+        for num_tokens in [8, 4, 6, 10, 12, 16, 20]:
+            if activation_dim % num_tokens == 0:
+                inferred_dim = activation_dim // num_tokens
+                if inferred_dim == memory_token_dim:
+                    num_memory_tokens = num_tokens
+                    break
+        
+        # Infer n_layer from decoder_layers
+        n_layer = 2  # Default
+        if "decoder_layers.layers.1.self_attn.in_proj_weight" in state_dict:
+            n_layer = 2
+        elif "decoder_layers.layers.3.self_attn.in_proj_weight" in state_dict:
+            n_layer = 4
+        else:
+            n_layer = 2  # Default from training
+        
+        n_head = 4  # Default
     
+    # Create model with inferred parameters
     model = ActionDecoderProbe(
         activation_dim=activation_dim,
         vocab_size=vocab_size,
         n_layer=n_layer,
         n_head=n_head,
-        n_embd=n_embd,
+        num_memory_tokens=num_memory_tokens,
         max_seq_len=max_seq_len,
     )
     
-    model.load_state_dict(state_dict)
-    model.eval()
-    model = model.to(device)
-    print(f"Model loaded: vocab_size={vocab_size}, activation_dim={activation_dim}")
+    # Try to load state dict, with fallback to CPU if device fails
+    try:
+        model.load_state_dict(state_dict)
+        model.eval()
+        model = model.to(device)
+        # Test if device actually works
+        if device == "cuda":
+            test_tensor = torch.tensor([1.0]).to(device)
+    except RuntimeError as e:
+        if "cuda" in str(e).lower() or "CUDA" in str(e):
+            print(f"⚠️  Warning: CUDA initialization failed: {e}")
+            print("   Falling back to CPU for visualization.")
+            device = "cpu"
+            model = model.to(device)
+        else:
+            raise
+    
+    print(f"Model loaded: vocab_size={vocab_size}, activation_dim={activation_dim}, "
+          f"n_layer={n_layer}, n_head={n_head}, num_memory_tokens={num_memory_tokens}, "
+          f"max_seq_len={max_seq_len}, device={device}")
     
     return model
 
@@ -203,8 +252,8 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run on",
+        default=None,
+        help="Device to run on (auto-detects if not specified, falls back to CPU if CUDA fails)",
     )
     parser.add_argument(
         "--disable-heuristic-stopping",
@@ -214,8 +263,26 @@ def main():
     
     args = parser.parse_args()
     
-    # Load model
+    # Auto-detect device if not specified (with fallback to CPU)
+    if args.device is None:
+        if torch.cuda.is_available():
+            try:
+                test_tensor = torch.tensor([1.0]).cuda()
+                args.device = "cuda"
+            except (AssertionError, RuntimeError):
+                args.device = "cpu"
+                print("⚠️  CUDA not available, using CPU")
+        else:
+            args.device = "cpu"
+    
+    # Load model (will handle device fallback internally)
     model = load_model(args.model_path, args.device)
+    
+    # Use the actual device the model is on (may have fallen back to CPU)
+    actual_device = next(model.parameters()).device
+    if actual_device.type != args.device:
+        print(f"⚠️  Model is on {actual_device}, not {args.device}")
+        args.device = str(actual_device)
     
     # Load test CSV
     print(f"\nLoading test data from: {args.test_csv}")
@@ -234,21 +301,14 @@ def main():
         args.env_indices = [idx for idx in args.env_indices if idx in available]
         print(f"Testing {len(args.env_indices)} specified grids")
     
-    # Load activations
+    # Load activations (load_activations_from_local handles both local and HF)
     print(f"\nLoading activations...")
-    if args.hf_repo_id:
-        activations = load_activations_from_hf(
-            repo_id=args.hf_repo_id,
-            path_in_repo=f"activations/{args.activations_dir}",
-            layer=args.layer,
-            grid_indices=args.env_indices,
-        )
-    else:
-        activations = load_activations_from_local(
-            activations_dir=args.activations_dir,
-            layer=args.layer,
-            grid_indices=args.env_indices,
-        )
+    activations = load_activations_from_local(
+        activations_dir=args.activations_dir,
+        layer=args.layer,
+        grid_indices=args.env_indices,
+        hf_repo_id=args.hf_repo_id,  # Pass None for local, or repo_id for HF
+    )
     
     print(f"Loaded {len(activations)} activations")
     
@@ -290,7 +350,9 @@ def main():
         activation = activations[env_idx]
         if activation.ndim > 1:
             activation = activation[-1]
-        activation = activation.unsqueeze(0).to(args.device).to(torch.float32)
+        # Use the actual device the model is on
+        actual_device = next(model.parameters()).device
+        activation = activation.unsqueeze(0).to(actual_device).to(torch.float32)
         
         with torch.no_grad():
             pred_actions_tensor = model.generate(
@@ -455,7 +517,327 @@ def main():
     print(f"Saved: {args.output_dir}/distance_to_goal_aggregate.png")
     plt.close()
     
-    # 3. Summary statistics
+    # 3. Prefix Accuracy by Sequence Position (TWO PLOTS: Sequence-level and Token-level)
+    print("\nComputing prefix accuracy (sequence-level and token-level)...")
+    
+    # Find maximum sequence length from true actions (what we're trying to predict)
+    max_seq_len = max(len(r["true_actions"]) for r in results if len(r["true_actions"]) > 0)
+    max_seq_len = min(max_seq_len, args.max_length)
+    
+    # SEQUENCE-LEVEL: First X actions all correct
+    prefix_seq_accuracies = []
+    prefix_seq_counts = []
+    baseline_seq_accuracies = []
+    
+    # TOKEN-LEVEL: Xth action correct
+    token_accuracies = []
+    token_counts = []
+    baseline_token_accuracies = []
+    
+    # Compute both metrics for each position
+    for pos in range(1, max_seq_len + 1):
+        # SEQUENCE-LEVEL: Are the first X actions all correct?
+        seq_correct_count = 0
+        seq_total_count = 0
+        
+        # TOKEN-LEVEL: Is the Xth action correct?
+        token_correct_count = 0
+        token_total_count = 0
+        
+        for r in results:
+            true_len = len(r["true_actions"])
+            pred_len = len(r["pred_actions"])
+            
+            # SEQUENCE-LEVEL: Only consider sequences where true sequence has at least pos actions
+            if true_len >= pos:
+                seq_total_count += 1
+                
+                # If prediction is shorter than pos, it's automatically incorrect
+                if pred_len < pos:
+                    seq_correct_count += 0  # Incorrect (can't match first X if prediction is too short)
+                else:
+                    # Check if first pos actions match exactly
+                    true_prefix = r["true_actions"][:pos]
+                    pred_prefix = r["pred_actions"][:pos]
+                    if true_prefix == pred_prefix:
+                        seq_correct_count += 1
+            
+            # TOKEN-LEVEL: Is the pos-th action (0-indexed: pos-1) correct?
+            if true_len >= pos:
+                token_total_count += 1
+                
+                # If prediction is shorter than pos, the pos-th action doesn't exist (incorrect)
+                if pred_len < pos:
+                    token_correct_count += 0  # Incorrect (prediction too short)
+                else:
+                    # Check if the pos-th action (index pos-1) matches
+                    if r["true_actions"][pos - 1] == r["pred_actions"][pos - 1]:
+                        token_correct_count += 1
+        
+        # Store sequence-level results
+        if seq_total_count > 0:
+            seq_accuracy = seq_correct_count / seq_total_count
+            prefix_seq_accuracies.append(seq_accuracy)
+            prefix_seq_counts.append(seq_total_count)
+        else:
+            prefix_seq_accuracies.append(0.0)
+            prefix_seq_counts.append(0)
+        
+        # Store token-level results
+        if token_total_count > 0:
+            token_accuracy = token_correct_count / token_total_count
+            token_accuracies.append(token_accuracy)
+            token_counts.append(token_total_count)
+        else:
+            token_accuracies.append(0.0)
+            token_counts.append(0)
+        
+        # Compute baselines
+        # Sequence-level: probability of getting first X actions all correct = (0.25)^X
+        baseline_seq = (0.25) ** pos
+        baseline_seq_accuracies.append(baseline_seq)
+        
+        # Token-level: probability of getting Xth action correct = 0.25 (always 25% for any position)
+        baseline_token = 0.25
+        baseline_token_accuracies.append(baseline_token)
+    
+    # Create TWO plots: Sequence-level and Token-level
+    
+    # ===== PLOT 1: SEQUENCE-LEVEL ACCURACY (First X actions all correct) =====
+    fig, ax = plt.subplots(1, 1, figsize=(14, 8))
+    
+    # Filter to only plot points with data (n > 0)
+    x_values_seq = []
+    model_accs_seq = []
+    baseline_accs_seq = []
+    counts_seq = []
+    improvements_seq = []
+    
+    for i, (x, acc, count, baseline) in enumerate(zip(range(1, max_seq_len + 1), 
+                                                      prefix_seq_accuracies, 
+                                                      prefix_seq_counts, 
+                                                      baseline_seq_accuracies)):
+        if count > 0:  # Only include points with data
+            x_values_seq.append(x)
+            model_accs_seq.append(acc)
+            baseline_accs_seq.append(baseline)
+            counts_seq.append(count)
+            improvements_seq.append(acc - baseline)
+    
+    # Fill area between model and baseline to show improvement
+    ax.fill_between(x_values_seq, baseline_accs_seq, model_accs_seq, 
+                    where=[m > b for m, b in zip(model_accs_seq, baseline_accs_seq)],
+                    alpha=0.3, color='green', label='Above Baseline', zorder=1)
+    ax.fill_between(x_values_seq, baseline_accs_seq, model_accs_seq, 
+                    where=[m <= b for m, b in zip(model_accs_seq, baseline_accs_seq)],
+                    alpha=0.2, color='red', label='Below Baseline', zorder=1)
+    
+    # Plot baseline (random chance: 25%^X for X actions)
+    ax.plot(x_values_seq, baseline_accs_seq, "--", label=f"Random Baseline (25%^X)", 
+            linewidth=2.5, color="#666666", alpha=0.8, zorder=2)
+    
+    # Plot model accuracy with better styling
+    ax.plot(x_values_seq, model_accs_seq, "o-", label="Model Accuracy", 
+            linewidth=3, markersize=12, color="#8B4CBF", zorder=4, 
+            markerfacecolor="#8B4CBF", markeredgecolor="white", markeredgewidth=2,
+            alpha=0.9)
+    
+    # Add percentage labels on points (for key points)
+    for i, (x, acc, count) in enumerate(zip(x_values_seq, model_accs_seq, counts_seq)):
+        # Only label every other point or key points to avoid clutter
+        if i % 2 == 0 or acc > 0.3 or count < 50:  # Label sparse points or high accuracy
+            ax.annotate(f"{acc:.1%}", xy=(x, acc), xytext=(x, acc + 0.08),
+                       fontsize=9, ha='center', fontweight='bold', alpha=0.9,
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                edgecolor='#8B4CBF', alpha=0.9, linewidth=1.5))
+    
+    # Add sample size annotations (smaller, less intrusive)
+    for x, acc, count in zip(x_values_seq, model_accs_seq, counts_seq):
+        y_offset = -0.08 if acc > 0.5 else 0.05
+        ax.annotate(f"n={count}", xy=(x, acc), xytext=(x, acc + y_offset),
+                   fontsize=8, ha='center', alpha=0.6, style='italic',
+                   bbox=dict(boxstyle='round,pad=0.2', facecolor='lightgray', 
+                            edgecolor='none', alpha=0.5))
+    
+    # Format y-axis as percentage
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y:.0%}'))
+    
+    ax.set_xlabel("Minimum Sequence Length (first X actions)", fontsize=14, fontweight='bold')
+    ax.set_ylabel("Accuracy", fontsize=14, fontweight='bold')
+    ax.set_title("Prefix Sequence Accuracy\n(Are the first X actions ALL correct?)", 
+                 fontsize=16, fontweight='bold', pad=20)
+    ax.set_ylim([0, 1.0])
+    if len(x_values_seq) > 0:
+        ax.set_xlim([min(x_values_seq) - 0.5, max(x_values_seq) + 0.5])
+        ax.set_xticks(x_values_seq)
+    
+    # Better grid
+    ax.grid(True, alpha=0.2, linestyle='-', axis='both', linewidth=0.5)
+    ax.grid(True, alpha=0.4, linestyle='--', axis='y', which='major', linewidth=1)
+    
+    # Better legend
+    ax.legend(loc='upper right', fontsize=11, framealpha=0.95, shadow=True, 
+             fancybox=True, borderpad=1)
+    
+    # Add horizontal line at 25% for reference
+    ax.axhline(y=0.25, color="#FF6B6B", linestyle=":", alpha=0.6, linewidth=2, 
+               label="25% Reference", zorder=0)
+    
+    # Add summary statistics box
+    if len(x_values_seq) > 0:
+        max_improvement = max(improvements_seq)
+        max_improvement_idx = improvements_seq.index(max_improvement)
+        avg_improvement = sum(improvements_seq) / len(improvements_seq)
+        
+        stats_text = (f"Max Improvement: {max_improvement:.1%} at X={x_values_seq[max_improvement_idx]}\n"
+                     f"Avg Improvement: {avg_improvement:.1%}\n"
+                     f"Best Accuracy: {max(model_accs_seq):.1%} at X={x_values_seq[model_accs_seq.index(max(model_accs_seq))]}")
+        
+        ax.text(0.98, 0.02, stats_text, transform=ax.transAxes, 
+               fontsize=10, verticalalignment='bottom', horizontalalignment='right',
+               bbox=dict(boxstyle='round,pad=0.8', facecolor='white', 
+                        edgecolor='#8B4CBF', alpha=0.9, linewidth=2))
+        
+        explanation = ("SEQUENCE-LEVEL: For each X, shows % of sequences where\n"
+                      "the first X predicted actions exactly match the first X true actions.")
+        ax.text(0.02, 0.98, explanation, transform=ax.transAxes, 
+               fontsize=10, verticalalignment='top', alpha=0.8,
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='#FFF9E6', 
+                        edgecolor='#8B4CBF', alpha=0.9, linewidth=1.5))
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "prefix_sequence_accuracy.png"), dpi=150)
+    print(f"Saved: {args.output_dir}/prefix_sequence_accuracy.png")
+    plt.close()
+    
+    # ===== PLOT 2: TOKEN-LEVEL ACCURACY (Xth action correct) =====
+    fig, ax = plt.subplots(1, 1, figsize=(14, 8))
+    
+    # Filter to only plot points with data (n > 0)
+    x_values_token = []
+    model_accs_token = []
+    baseline_accs_token = []
+    counts_token = []
+    improvements_token = []
+    
+    for i, (x, acc, count, baseline) in enumerate(zip(range(1, max_seq_len + 1), 
+                                                      token_accuracies, 
+                                                      token_counts, 
+                                                      baseline_token_accuracies)):
+        if count > 0:  # Only include points with data
+            x_values_token.append(x)
+            model_accs_token.append(acc)
+            baseline_accs_token.append(baseline)
+            counts_token.append(count)
+            improvements_token.append(acc - baseline)
+    
+    # Fill area between model and baseline to show improvement
+    ax.fill_between(x_values_token, baseline_accs_token, model_accs_token, 
+                    where=[m > b for m, b in zip(model_accs_token, baseline_accs_token)],
+                    alpha=0.3, color='green', label='Above Baseline', zorder=1)
+    ax.fill_between(x_values_token, baseline_accs_token, model_accs_token, 
+                    where=[m <= b for m, b in zip(model_accs_token, baseline_accs_token)],
+                    alpha=0.2, color='red', label='Below Baseline', zorder=1)
+    
+    # Plot baseline (always 25% for any position)
+    ax.axhline(y=0.25, color="#666666", linestyle="--", linewidth=2.5, 
+               alpha=0.8, label="Random Baseline (25%)", zorder=2)
+    
+    # Plot model accuracy with better styling
+    ax.plot(x_values_token, model_accs_token, "o-", label="Model Accuracy", 
+            linewidth=3, markersize=12, color="#2E86AB", zorder=4, 
+            markerfacecolor="#2E86AB", markeredgecolor="white", markeredgewidth=2,
+            alpha=0.9)
+    
+    # Add percentage labels on points (for key points)
+    for i, (x, acc, count) in enumerate(zip(x_values_token, model_accs_token, counts_token)):
+        # Label every point or key points
+        if i % 2 == 0 or acc > 0.35 or count < 50:  # Label sparse points or high accuracy
+            ax.annotate(f"{acc:.1%}", xy=(x, acc), xytext=(x, acc + 0.08),
+                       fontsize=9, ha='center', fontweight='bold', alpha=0.9,
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                edgecolor='#2E86AB', alpha=0.9, linewidth=1.5))
+    
+    # Add sample size annotations (smaller, less intrusive)
+    for x, acc, count in zip(x_values_token, model_accs_token, counts_token):
+        y_offset = -0.08 if acc > 0.5 else 0.05
+        ax.annotate(f"n={count}", xy=(x, acc), xytext=(x, acc + y_offset),
+                   fontsize=8, ha='center', alpha=0.6, style='italic',
+                   bbox=dict(boxstyle='round,pad=0.2', facecolor='lightgray', 
+                            edgecolor='none', alpha=0.5))
+    
+    # Format y-axis as percentage
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y:.0%}'))
+    
+    ax.set_xlabel("Action Position (Xth action)", fontsize=14, fontweight='bold')
+    ax.set_ylabel("Accuracy", fontsize=14, fontweight='bold')
+    ax.set_title("Token-Level Accuracy by Position\n(Is the Xth action correct?)", 
+                 fontsize=16, fontweight='bold', pad=20)
+    ax.set_ylim([0, 1.0])
+    if len(x_values_token) > 0:
+        ax.set_xlim([min(x_values_token) - 0.5, max(x_values_token) + 0.5])
+        ax.set_xticks(x_values_token)
+    
+    # Better grid
+    ax.grid(True, alpha=0.2, linestyle='-', axis='both', linewidth=0.5)
+    ax.grid(True, alpha=0.4, linestyle='--', axis='y', which='major', linewidth=1)
+    
+    # Better legend
+    ax.legend(loc='upper right', fontsize=11, framealpha=0.95, shadow=True, 
+             fancybox=True, borderpad=1)
+    
+    # Add summary statistics box
+    if len(x_values_token) > 0:
+        max_improvement = max(improvements_token)
+        max_improvement_idx = improvements_token.index(max_improvement)
+        avg_improvement = sum(improvements_token) / len(improvements_token)
+        positions_above_baseline = sum(1 for imp in improvements_token if imp > 0)
+        
+        stats_text = (f"Max Improvement: {max_improvement:.1%} at pos {x_values_token[max_improvement_idx]}\n"
+                     f"Avg Improvement: {avg_improvement:.1%}\n"
+                     f"Positions Above Baseline: {positions_above_baseline}/{len(x_values_token)}\n"
+                     f"Best Accuracy: {max(model_accs_token):.1%} at pos {x_values_token[model_accs_token.index(max(model_accs_token))]}")
+        
+        ax.text(0.98, 0.02, stats_text, transform=ax.transAxes, 
+               fontsize=10, verticalalignment='bottom', horizontalalignment='right',
+               bbox=dict(boxstyle='round,pad=0.8', facecolor='white', 
+                        edgecolor='#2E86AB', alpha=0.9, linewidth=2))
+        
+        explanation = ("TOKEN-LEVEL: For each position X, shows % of sequences where\n"
+                      "the Xth predicted action matches the Xth true action.")
+        ax.text(0.02, 0.98, explanation, transform=ax.transAxes, 
+               fontsize=10, verticalalignment='top', alpha=0.8,
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='#E6F3FF', 
+                        edgecolor='#2E86AB', alpha=0.9, linewidth=1.5))
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "prefix_token_accuracy.png"), dpi=150)
+    print(f"Saved: {args.output_dir}/prefix_token_accuracy.png")
+    plt.close()
+    
+    # Print summary statistics for both
+    print("\n" + "=" * 60)
+    print("SEQUENCE-LEVEL Prefix Accuracy Summary:")
+    print("(Are the first X actions ALL correct?)")
+    print("=" * 60)
+    for i, (prefix_len, acc, count, baseline) in enumerate(zip(x_values_seq, model_accs_seq, counts_seq, baseline_accs_seq)):
+        if count > 0:
+            improvement = acc - baseline
+            print(f"First {prefix_len:2d} actions: Accuracy={acc:.3f} (n={count:3d}), "
+                  f"Baseline={baseline:.3f}, Improvement={improvement:+.3f}")
+    
+    print("\n" + "=" * 60)
+    print("TOKEN-LEVEL Accuracy Summary:")
+    print("(Is the Xth action correct?)")
+    print("=" * 60)
+    for i, (pos, acc, count, baseline) in enumerate(zip(x_values_token, model_accs_token, counts_token, baseline_accs_token)):
+        if count > 0:
+            improvement = acc - baseline
+            print(f"Position {pos:2d}: Accuracy={acc:.3f} (n={count:3d}), "
+                  f"Baseline={baseline:.3f}, Improvement={improvement:+.3f}")
+    print("=" * 60)
+    
+    # 4. Summary statistics
     true_reached = sum(1 for r in results if r["true_reached_goal"])
     pred_reached = sum(1 for r in results if r["pred_reached_goal"])
     
