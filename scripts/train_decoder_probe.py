@@ -106,10 +106,11 @@ def main():
         help="Number of attention heads (default: 4)",
     )
     parser.add_argument(
-        "--n-embd",
+        "--num-memory-tokens",
         type=int,
-        default=256,
-        help="Hidden dimension (default: 256)",
+        default=8,
+        help="Number of memory tokens to split activation into (default: 8). "
+             "activation_dim must be divisible by this. E.g., 2880/8=360 dims per token.",
     )
     parser.add_argument(
         "--max-seq-len",
@@ -283,12 +284,13 @@ def main():
 
     # Step 6: Create model
     print("\n🏗️  Step 4: Creating decoder probe model...")
+    print(f"  Using {args.num_memory_tokens} memory tokens ({activation_dim // args.num_memory_tokens} dims each)")
     model = ActionDecoderProbe(
         activation_dim=activation_dim,
         vocab_size=args.vocab_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
-        n_embd=args.n_embd,
+        num_memory_tokens=args.num_memory_tokens,
         max_seq_len=args.max_seq_len,
         eos_loss_weight_threshold=args.eos_weight_threshold,
     )

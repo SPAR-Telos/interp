@@ -26,15 +26,18 @@ DEFAULT_VOCAB_SIZE = 7
 class ActionDecoderProbe(nn.Module):
     """Small transformer decoder that predicts action sequences from LLM activations.
 
-    This model uses the LLM activation as an input embedding (prefix-tuning style)
-    and generates a sequence of action tokens autoregressively.
+    This model uses the LLM activation as input, splitting it into multiple memory tokens
+    for cross-attention. This allows different decoder positions to attend to different
+    aspects of the activation.
 
     Args:
-        activation_dim: Dimension of the input LLM activation vector
+        activation_dim: Dimension of the input LLM activation vector (e.g., 2880)
         vocab_size: Vocabulary size (default: 7 for 0-3=actions, 4=SOS, 5=EOS, 6=PAD)
         n_layer: Number of transformer decoder layers (default: 4)
         n_head: Number of attention heads (default: 4)
-        n_embd: Hidden dimension of the decoder (default: 256)
+        num_memory_tokens: Number of memory tokens to split activation into (default: 8).
+            activation_dim must be divisible by num_memory_tokens.
+            Each token will have dimension activation_dim // num_memory_tokens.
         max_seq_len: Maximum sequence length for action predictions (default: 100)
         dropout: Dropout rate (default: 0.1)
         eos_loss_weight_threshold: Threshold for position-weighted EOS loss (default: 3.0).
@@ -47,7 +50,7 @@ class ActionDecoderProbe(nn.Module):
         vocab_size: int = DEFAULT_VOCAB_SIZE,
         n_layer: int = 4,
         n_head: int = 4,
-        n_embd: int = 256,
+        num_memory_tokens: int = 8,
         max_seq_len: int = 100,
         dropout: float = 0.1,
         eos_loss_weight_threshold: float = 3.0,
@@ -56,31 +59,41 @@ class ActionDecoderProbe(nn.Module):
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.activation_dim = activation_dim
-        self.n_embd = n_embd
         self.eos_loss_weight_threshold = eos_loss_weight_threshold
         
-        # If n_embd == activation_dim, use identity (no projection)
-        # This preserves the original activation exactly
-        self.use_identity_projection = (n_embd == activation_dim)
+        # Multi-token memory configuration
+        # Split the activation into num_memory_tokens tokens, each with memory_token_dim dimensions
+        self.num_memory_tokens = num_memory_tokens
         
-        if self.use_identity_projection:
-            # No projection - use activation directly
-            self.activation_projection = nn.Identity()
-        else:
-            # Project activation to decoder embedding dimension
-            self.activation_projection = nn.Linear(activation_dim, n_embd)
+        if activation_dim % num_memory_tokens != 0:
+            raise ValueError(
+                f"activation_dim ({activation_dim}) must be divisible by num_memory_tokens ({num_memory_tokens}). "
+                f"Try num_memory_tokens in: {[i for i in [4, 5, 6, 8, 10, 12, 16, 20] if activation_dim % i == 0]}"
+            )
+        
+        self.memory_token_dim = activation_dim // num_memory_tokens  # e.g., 2880 // 8 = 360
+        
+        # Validate that memory_token_dim is divisible by n_head for multi-head attention
+        if self.memory_token_dim % n_head != 0:
+            raise ValueError(
+                f"memory_token_dim ({self.memory_token_dim}) must be divisible by n_head ({n_head}). "
+                f"activation_dim={activation_dim}, num_memory_tokens={num_memory_tokens}"
+            )
+        
+        # Store for reference (n_embd is now memory_token_dim)
+        self.n_embd = self.memory_token_dim
 
-        # Action token embeddings
-        self.action_embeddings = nn.Embedding(vocab_size, n_embd)
+        # Action token embeddings (dimension matches memory tokens)
+        self.action_embeddings = nn.Embedding(vocab_size, self.memory_token_dim)
 
         # Position embeddings for action sequence
-        self.position_embeddings = nn.Embedding(max_seq_len, n_embd)
+        self.position_embeddings = nn.Embedding(max_seq_len, self.memory_token_dim)
 
-        # Custom transformer decoder blocks
+        # Transformer decoder blocks (d_model = memory_token_dim)
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=n_embd,
+            d_model=self.memory_token_dim,
             nhead=n_head,
-            dim_feedforward=n_embd * 4,
+            dim_feedforward=self.memory_token_dim * 4,
             dropout=dropout,
             activation="gelu",
             batch_first=True,
@@ -88,7 +101,7 @@ class ActionDecoderProbe(nn.Module):
         self.decoder_layers = nn.TransformerDecoder(decoder_layer, num_layers=n_layer)
 
         # Output projection to vocab
-        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.lm_head = nn.Linear(self.memory_token_dim, vocab_size)
 
         # Initialize weights
         self._init_weights()
@@ -97,9 +110,6 @@ class ActionDecoderProbe(nn.Module):
         """Initialize weights for stronger forward pass signal."""
         # Using larger std (0.1) instead of GPT-2 default (0.02) 
         # to ensure stronger signal through the network
-        if not self.use_identity_projection:
-            nn.init.normal_(self.activation_projection.weight, std=0.1)
-            nn.init.normal_(self.activation_projection.bias, std=0.01)
         nn.init.normal_(self.action_embeddings.weight, std=0.1)
 
     def forward(
@@ -133,10 +143,11 @@ class ActionDecoderProbe(nn.Module):
         if activation.dtype != torch.float32:
             activation = activation.to(torch.float32)
 
-        # Project activation to decoder embedding space (prefix-style input)
-        # This serves as the "memory" or "context" that conditions action generation
-        activation_embed = self.activation_projection(activation)  # (batch_size, n_embd)
-        activation_embed = activation_embed.unsqueeze(1)  # (batch_size, 1, n_embd) - this is the "prefix"
+        # Reshape activation into multiple memory tokens for richer cross-attention
+        # Instead of 1 token of 2880 dims, we get 8 tokens of 360 dims each
+        # This allows different decoder positions to attend to different "aspects" of the activation
+        activation_embed = activation.view(batch_size, self.num_memory_tokens, self.memory_token_dim)
+        # Shape: (batch_size, num_memory_tokens, memory_token_dim) e.g., (32, 8, 360)
 
         # Construct decoder_input from labels if not provided (teacher forcing)
         if decoder_input is None and labels is not None:
@@ -409,8 +420,9 @@ class ActionDecoderProbe(nn.Module):
         if activation.dtype != torch.float32:
             activation = activation.to(torch.float32)
 
-        # Project activation to embedding space (this is the memory/prefix)
-        activation_embed = self.activation_projection(activation).unsqueeze(1)  # (batch_size, 1, n_embd)
+        # Reshape activation into multiple memory tokens for cross-attention
+        # Shape: (batch_size, num_memory_tokens, memory_token_dim) e.g., (32, 8, 360)
+        activation_embed = activation.view(batch_size, self.num_memory_tokens, self.memory_token_dim)
 
         # Start with SOS token
         decoder_input = torch.full((batch_size, 1), SOS_TOKEN_ID, dtype=torch.long, device=device)

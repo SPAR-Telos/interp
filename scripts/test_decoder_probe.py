@@ -142,6 +142,12 @@ def main():
         default=None,
         help="Max sequence length for position embeddings (inferred from checkpoint if not provided)",
     )
+    parser.add_argument(
+        "--num-memory-tokens",
+        type=int,
+        default=None,
+        help="Number of memory tokens (inferred from checkpoint if not provided)",
+    )
 
     args = parser.parse_args()
 
@@ -163,33 +169,35 @@ def main():
         state_dict = checkpoint["model_state_dict"]
         # Try to get activation_dim from checkpoint metadata
         activation_dim = checkpoint.get("activation_dim", 2880)  # Default for gpt-oss-20b
-        vocab_size = checkpoint.get("vocab_size", 5)
+        vocab_size = checkpoint.get("vocab_size", 7)
         n_layer = checkpoint.get("n_layer", 4)
         n_head = checkpoint.get("n_head", 4)
-        n_embd = checkpoint.get("n_embd", 256)
+        num_memory_tokens = checkpoint.get("num_memory_tokens", 8)
         max_seq_len = checkpoint.get("max_seq_len", 100)
-    elif isinstance(checkpoint, dict) and any(k.startswith("activation_projection") for k in checkpoint.keys()):
+    else:
         # It's a state_dict directly
         state_dict = checkpoint
-        # Try to infer from state_dict
-        # activation_projection.weight shape is (n_embd, activation_dim)
-        if "activation_projection.weight" in state_dict:
-            n_embd, activation_dim = state_dict["activation_projection.weight"].shape
-        else:
-            activation_dim = 2880  # Default for gpt-oss-20b
-            n_embd = 256
         
-        # action_embeddings.weight shape is (vocab_size, n_embd)
+        # Default values
+        activation_dim = 2880  # Default for gpt-oss-20b
+        vocab_size = 7
+        n_head = 4
+        
+        # action_embeddings.weight shape is (vocab_size, memory_token_dim)
+        # memory_token_dim = activation_dim // num_memory_tokens
         if "action_embeddings.weight" in state_dict:
-            vocab_size, _ = state_dict["action_embeddings.weight"].shape
+            vocab_size, memory_token_dim = state_dict["action_embeddings.weight"].shape
         else:
-            vocab_size = 5
+            memory_token_dim = 360  # Default: 2880 / 8
+        
+        # Infer num_memory_tokens from memory_token_dim
+        # num_memory_tokens = activation_dim // memory_token_dim
+        num_memory_tokens = activation_dim // memory_token_dim
         
         # Infer n_layer from state_dict (count decoder layers)
         layer_indices = set()
         for key in state_dict.keys():
             if "decoder_layers.layers." in key:
-                # Extract layer index from key like "decoder_layers.layers.0.self_attn.in_proj_weight"
                 parts = key.split(".")
                 for i, part in enumerate(parts):
                     if part == "layers" and i + 1 < len(parts):
@@ -204,23 +212,23 @@ def main():
             max_seq_len, _ = state_dict["position_embeddings.weight"].shape
         else:
             max_seq_len = 100
-        
-        n_head = 4  # Default, can't easily infer from state_dict
-    else:
-        raise ValueError("Could not parse model checkpoint. Expected state_dict or dict with 'model_state_dict'")
 
     # Override with command-line arguments if provided
     if args.n_layer is not None:
         n_layer = args.n_layer
     if args.max_seq_len is not None:
         max_seq_len = args.max_seq_len
+    if args.num_memory_tokens is not None:
+        num_memory_tokens = args.num_memory_tokens
+    
+    memory_token_dim = activation_dim // num_memory_tokens
     
     print(f"Model parameters:")
     print(f"  Activation dim: {activation_dim}")
     print(f"  Vocab size: {vocab_size}")
     print(f"  Layers: {n_layer}")
     print(f"  Heads: {n_head}")
-    print(f"  Embedding dim: {n_embd}")
+    print(f"  Memory tokens: {num_memory_tokens} x {memory_token_dim} dims")
     print(f"  Max seq len: {max_seq_len}")
 
     # Create model
@@ -229,7 +237,7 @@ def main():
         vocab_size=vocab_size,
         n_layer=n_layer,
         n_head=n_head,
-        n_embd=n_embd,
+        num_memory_tokens=num_memory_tokens,
         max_seq_len=max_seq_len,
     )
     
