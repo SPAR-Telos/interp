@@ -67,10 +67,10 @@ def plot_overall_highest_prob(predictions_dir: str):
 
     # Plotting
     os.makedirs(plotting_dir, exist_ok=True)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 3.5), gridspec_kw={"width_ratios": [1.7, 1]})
 
     x = np.arange(len(LAYERS))
-    bar_width = 0.35
+    bar_width = 0.40
 
     # Top subplot: Bar plots for accuracy
     bars1 = ax1.bar(x - bar_width / 2, goal_accuracies, bar_width, label="Goal", color="steelblue")
@@ -85,24 +85,27 @@ def plot_overall_highest_prob(predictions_dir: str):
                 f"{acc * 100:.1f}",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=9,
             )
     for bar, acc in zip(bars2, agent_accuracies, strict=False):
         if not np.isnan(acc):
             ax1.text(
                 bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.02,
+                bar.get_height() + 0.04,
                 f"{acc * 100:.1f}",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=9,
             )
 
+    ax1.set_xlabel("Layer", fontsize=18)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(LAYERS, fontsize=14)
     ax1.set_ylabel("Accuracy", fontsize=18)
     ax1.set_ylim(0, 1.15)
-    ax1.legend(fontsize=14, loc="upper right")
+    ax1.legend(fontsize=13, loc="upper right", ncols=2)
     ax1.grid(True, linestyle="--", alpha=0.6, axis="y")
-    ax1.set_title("Highest Probability Cell Accuracy by Layer", fontsize=20)
+    # ax1.set_title("Highest Probability Cell Accuracy by Layer", fontsize=20)
 
     # Bottom subplot: Line plots for Manhattan distance
     ax2.plot(
@@ -129,12 +132,12 @@ def plot_overall_highest_prob(predictions_dir: str):
     )
 
     ax2.set_xlabel("Layer", fontsize=18)
-    ax2.set_ylabel("Avg Manhattan Distance", fontsize=18)
+    ax2.set_ylabel("Manhattan Distance", fontsize=18)
     ax2.set_xticks(x)
-    ax2.set_xticklabels(LAYERS)
-    ax2.legend(fontsize=14, loc="upper right")
+    ax2.set_xticklabels(LAYERS, fontsize=14)
+    ax2.legend(fontsize=13, loc="upper right", ncols=2)
     ax2.grid(True, linestyle="--", alpha=0.6)
-    ax2.set_title("Manhattan Distance from Ground Truth by Layer", fontsize=20)
+    # ax2.set_title("Manhattan Distance from Ground Truth by Layer", fontsize=20)
 
     plt.tight_layout()
 
@@ -144,6 +147,9 @@ def plot_overall_highest_prob(predictions_dir: str):
     results_path = os.path.join(plotting_dir, results_filename)
     plt.savefig(results_path, dpi=300)
     print(f"\nPlot saved to {results_path}")
+    pdf_path = results_path.replace(".png", ".pdf")
+    plt.savefig(pdf_path, format="pdf")
+    print(f"PDF plot saved to {pdf_path}")
 
 
 if __name__ == "__main__":

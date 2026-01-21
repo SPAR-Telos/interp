@@ -58,16 +58,16 @@ def plot_probe_accuracy(results_dir: str):
 
     # 2. Plot the accuracy curves
     os.makedirs(plotting_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 5))
 
     ax.plot(
         layers,
         linear_accuracies,
         label="Linear Probe",
         color="teal",
-        linewidth=2,
+        linewidth=3,
         marker="o",
-        markersize=8,
+        markersize=9,
         markeredgecolor="white",
         markeredgewidth=2,
     )
@@ -77,18 +77,18 @@ def plot_probe_accuracy(results_dir: str):
         mlp_accuracies,
         label="MLP Probe",
         color="darkmagenta",
-        linewidth=2,
+        linewidth=3,
         marker="o",
-        markersize=8,
+        markersize=9,
         markeredgecolor="white",
         markeredgewidth=2,
     )
 
     # write best results at argmax for each line
     # linear
-    ax.text(linear_max_layer, linear_max - 0.20, linear_best_results_string, fontsize=7, ha="center", va="bottom")
+    ax.text(linear_max_layer, linear_max - 0.24, linear_best_results_string, fontsize=10, ha="center", va="bottom")
     # mlp
-    ax.text(mlp_max_layer, mlp_max + 0.03, mlp_best_results_string, fontsize=7, ha="center", va="bottom")
+    ax.text(mlp_max_layer, mlp_max + 0.03, mlp_best_results_string, fontsize=10, ha="center", va="bottom")
 
     # Grid lines
     ax.grid(True, linestyle="--", alpha=0.6)
@@ -111,13 +111,15 @@ def plot_probe_accuracy(results_dir: str):
         fontsize=20,
         ncols=2,
         frameon=False,
-        bbox_to_anchor=(0.5, 1.30),
+        bbox_to_anchor=(0.5, 1.15),
     )
     plt.tight_layout()
 
     plt.savefig(results_path, dpi=300)
     svg_path = results_path.replace(".png", ".svg")
     plt.savefig(svg_path, format="svg")
+    pdf_path = results_path.replace(".png", ".pdf")
+    plt.savefig(pdf_path, format="pdf")
 
 
 if __name__ == "__main__":
