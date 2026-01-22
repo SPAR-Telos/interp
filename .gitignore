@@ -209,3 +209,7 @@ __marimo__/
 
 # Don't store activations saved under data/activations
 data/activations/
+
+# Model files (too large for GitHub)
+models/*.pt
+models/*_full*.json
