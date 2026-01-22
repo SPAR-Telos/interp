@@ -283,7 +283,7 @@ def build_truncated_input(
     """
     prefix_ids = [t["token_id"] for t in trajectory["prompt"]["prompt_prefix_tokens"]]
     grid_ids = [t["token_id"] for t in step["grid_state_tokens"]]
-    suffix_ids = [t["token_id"] for t in trajectory["prompt"]["prompt_suffix_tokens"]]
+    suffix_ids = [t["token_id"] for t in step["prompt_suffix_tokens"]]
     output_ids = [t["token_id"] for t in step["output_tokens"]]
 
     # Concatenate all token IDs
