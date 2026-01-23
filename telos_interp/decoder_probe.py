@@ -92,7 +92,7 @@ class OneShotPrefixProbe(nn.Module):
     def __init__(
         self,
         activation_dim: int = 2880,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 1280,
         num_actions: int = DEFAULT_VOCAB_SIZE,
         num_memory_tokens: int = 3,
         max_path_len: int = 20,  # Changed from 8 to accommodate long-tail sequences
