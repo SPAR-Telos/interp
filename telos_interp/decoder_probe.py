@@ -19,6 +19,7 @@ from telos_interp.probing import load_activations
 # Special token IDs
 # Actions: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=GOAL/EOS
 PAD_TOKEN_ID = -100  # Padding token (using -100 for ignore_index)
+EOS_TOKEN_ID = 4      # End-of-sequence token (same as GOAL token)
 
 # Vocabulary size: 5 actions (0-3=directions, 4=GOAL/EOS)
 DEFAULT_VOCAB_SIZE = 5
@@ -35,47 +36,48 @@ class OneShotPrefixProbe(nn.Module):
     However, you should filter outliers to avoid excessive query tokens.
     
     Trade-offs:
-    - max_path_len=36 means 36 learned query parameters (36 * hidden_dim = 36K params)
-    - Model always predicts 36 steps, even for 2-step sequences (uses padding)
-    - More query tokens = more computation and potentially harder to train
+    - max_path_len=10 means 10 learned query parameters (10 * hidden_dim)
+    - Model predicts up to 10 steps, using EOS token to signal completion
+    - Shorter sequences are more accurate; longer sequences (>10) will be truncated
     
-    Handling Long-Tail Distributions (e.g., median=6 but max=20):
-    ---------------------------------------------------------------
-    When most sequences are short but some are long, the model prioritizes early positions:
+    Handling Sequence Length (max_path_len=10):
+    --------------------------------------------
+    The model focuses on the first 10 actions as early predictions are more accurate:
     
     1. Position-Weighted Loss (position_loss_decay=0.95):
        - Early positions get higher loss weight (exponential decay)
        - Position 0: weight = 1.0
-       - Position 10: weight = 0.60  (0.95^10)
-       - Position 15: weight = 0.46  (0.95^15)
+       - Position 5: weight = 0.77  (0.95^5)
+       - Position 9: weight = 0.63  (0.95^9)
        - This makes the model focus on getting early steps right
     
     2. Priority Initialization:
-       - First 15 queries: initialized with std=0.15 (strong signal)
+       - First 8 queries: initialized with std=0.15 (strong signal)
        - Remaining queries: initialized with std=0.05 (weak signal)
        - Gives early positions better starting point for learning
     
     3. Position Embeddings:
        - Each query slot has learnable position-specific embedding
-       - Allows model to learn that early slots are "primary", later slots "secondary"
+       - Allows model to learn position-specific behavior
     
-    This approach lets you use max_path_len=20 to handle the tail, while the model
-    naturally focuses most of its capacity on the first 10-15 positions where most
-    sequences actually live.
+    4. EOS Token Handling:
+       - Token 4 (GOAL/EOS) must be added after action sequences in training data
+       - Model predicts EOS to signal end of sequence
+       - Sequences longer than max_path_len are truncated
     
     Recommendations:
-    - Filter sequences to a reasonable max (e.g., 20-36 steps)
-    - Use scripts/filter_sequences_by_length.py to remove outliers
-    - For long-tail data, set max_path_len to ~2x your median length
+    - Sequences should include EOS token (4) after the last action
+    - Training data format: [action, action, ..., EOS, PAD, PAD, ...]
+    - Sequences longer than max_path_len=10 will be truncated
+    - Most grid navigation sequences are < 10 steps
     
     Example usage:
-        # Filter your data first to remove outliers
-        # python scripts/filter_sequences_by_length.py --max-length 20
+        # Prepare sequences with EOS tokens
+        # actions = [0, 1, 2, 3, 4, -100, -100, ...]  # Include EOS (4) before padding
         
         # Then load and train
-        train_data = torch.load('data/processed/action_sequences_train_filtered.pt')
-        max_len = train_data['stats']['max_length']  # e.g., 20
-        model = OneShotPrefixProbe(max_path_len=max_len, position_loss_decay=0.95)
+        train_data = torch.load('data/processed/action_sequences_train_with_eos.pt')
+        model = OneShotPrefixProbe(max_path_len=10, position_loss_decay=0.95)
     
     Args:
         activation_dim: Dimension of the input LLM activation vector (default: 2880)
@@ -83,6 +85,7 @@ class OneShotPrefixProbe(nn.Module):
         num_actions: Number of action types (default: 5 for 0-3=directions, 4=GOAL/EOS)
         num_memory_tokens: Number of reasoning trace activations (default: 3)
         max_path_len: Number of learned query slots for trajectory. MUST be >= longest sequence!
+                      Default 10 focuses on early actions which are more accurately predicted.
         n_layers: Number of transformer decoder layers (default: 4)
         n_heads: Number of attention heads (default: 8)
         dropout: Dropout rate (default: 0.1)
@@ -95,11 +98,11 @@ class OneShotPrefixProbe(nn.Module):
         hidden_dim: int = 1280,
         num_actions: int = DEFAULT_VOCAB_SIZE,
         num_memory_tokens: int = 3,
-        max_path_len: int = 20,  # Changed from 8 to accommodate long-tail sequences
+        max_path_len: int = 10,  # Reduced from 20: early actions are more accurate, most sequences < 10
         n_layers: int = 4,
         n_heads: int = 8,
         dropout: float = 0.1,
-        position_loss_decay: float = 0.95,  # Decay factor for position-based loss weighting (0.95^10 ≈ 0.60)
+        position_loss_decay: float = 0.95,  # Decay factor for position-based loss weighting (0.95^5 ≈ 0.77)
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -128,7 +131,7 @@ class OneShotPrefixProbe(nn.Module):
         self.query_position_embeddings = nn.Parameter(torch.randn(max_path_len, hidden_dim))
         
         # 3. THE TRANSFORMER DECODER (The Processor)
-        # Queries (8) attend to Memory (3)
+        # Queries (max_path_len, default 10) attend to Memory (3)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=n_heads,
@@ -144,13 +147,14 @@ class OneShotPrefixProbe(nn.Module):
         
         # Initialize queries with position-based priority
         # Early positions get stronger initialization (higher std)
-        self._init_query_priorities(priority_cutoff=min(15, max_path_len))
+        # For max_path_len=10, first 8 positions get priority
+        self._init_query_priorities(priority_cutoff=min(8, max_path_len))
     
-    def _init_query_priorities(self, priority_cutoff: int = 15):
+    def _init_query_priorities(self, priority_cutoff: int = 8):
         """Initialize queries with higher magnitude for early positions.
         
         Args:
-            priority_cutoff: First N positions get priority initialization
+            priority_cutoff: First N positions get priority initialization (default: 8)
         """
         with torch.no_grad():
             # Early positions (0 to priority_cutoff) get std=0.15 (stronger signal)
@@ -202,7 +206,7 @@ class OneShotPrefixProbe(nn.Module):
         # to see the entire reasoning trace conclusion.
         path_latent = self.decoder(tgt=queries, memory=memory)
         
-        # 4. Final prediction per slot: [Batch, 8, num_actions]
+        # 4. Final prediction per slot: [Batch, max_path_len, num_actions]
         logits = self.action_head(path_latent)
         
         # 5. Compute loss if labels are provided
@@ -264,7 +268,7 @@ class OneShotPrefixProbe(nn.Module):
         self.eval()
         
         with torch.no_grad():
-            # Get logits for all 8 positions at once
+            # Get logits for all max_path_len positions at once
             logits = self.forward(activations)  # (batch_size, max_path_len, num_actions)
             
             # Apply temperature

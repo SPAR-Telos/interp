@@ -17,7 +17,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from telos_interp.decoder_probe import OneShotPrefixProbe, train_decoder_probe, PAD_TOKEN_ID
+from telos_interp.decoder_probe import OneShotPrefixProbe, train_decoder_probe, PAD_TOKEN_ID, EOS_TOKEN_ID
 
 
 # Action mapping
@@ -78,18 +78,23 @@ def load_trajectory_data(
             - actions: (max_seq_len,) tensor with padding
         - Statistics dictionary
     """
+    split_display = split.upper() if split else "ROOT"
     print(f"\n{'='*80}")
-    print(f"Loading {split.upper()} data")
-    print(f"  Activations: {activations_repo}/{split}")
-    print(f"  Trajectories: {trajectories_repo}/{split}")
+    print(f"Loading {split_display} data")
+    print(f"  Activations: {activations_repo}/{split if split else '(root)'}")
+    print(f"  Trajectories: {trajectories_repo}/{split if split else '(root)'}")
     print(f"  Layer: {layer}")
     print(f"  Max sequence length: {max_seq_len}")
     print(f"{'='*80}\n")
     
     # List trajectory JSON files to get trajectory names
     fs = HfFileSystem()
-    traj_path = f"datasets/{trajectories_repo}/{split}"
-    print(f"Listing trajectory files...")
+    # Handle both split subdirectories (train/val) and root-level files (test)
+    if split:
+        traj_path = f"datasets/{trajectories_repo}/{split}"
+    else:
+        traj_path = f"datasets/{trajectories_repo}"
+    print(f"Listing trajectory files from {traj_path}...")
     traj_files = fs.ls(traj_path, detail=False)
     json_files = [f for f in traj_files if f.endswith('.json')]
     
@@ -131,8 +136,10 @@ def load_trajectory_data(
                 stats['skipped_parse_error'] += 1
                 continue
             
-            # Skip if too long
-            if len(actions) > max_seq_len:
+            # Skip if too long (need room for EOS token)
+            # If actions has length N, after adding EOS it becomes N+1
+            # So we need N+1 <= max_seq_len, which means N < max_seq_len
+            if len(actions) >= max_seq_len:
                 stats['skipped_seq_too_long'] += 1
                 continue
             
@@ -142,8 +149,14 @@ def load_trajectory_data(
             # then look for folders starting with traj_name
             activation_tensors = []
             try:
+                # Construct paths based on whether split is provided
+                if split:
+                    split_prefix = f"{split}/"
+                else:
+                    split_prefix = ""
+                
                 # Try exact match first
-                output_folder = f"datasets/{activations_repo}/{split}/{traj_name}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
+                output_folder = f"datasets/{activations_repo}/{split_prefix}{traj_name}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
                 output_files = None
                 
                 try:
@@ -151,7 +164,7 @@ def load_trajectory_data(
                 except Exception as e:
                     # Exact match failed, try prefix match
                     # List all folders in split directory and find one starting with traj_name
-                    split_path = f"datasets/{activations_repo}/{split}"
+                    split_path = f"datasets/{activations_repo}/{split}" if split else f"datasets/{activations_repo}"
                     try:
                         all_folders = fs.ls(split_path, detail=False)
                         matching_folders = [
@@ -168,7 +181,7 @@ def load_trajectory_data(
                         matching_folders = sorted(matching_folders, key=lambda x: len(x))
                         matched_folder = matching_folders[0].split('/')[-1]
                         
-                        output_folder = f"datasets/{activations_repo}/{split}/{matched_folder}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
+                        output_folder = f"datasets/{activations_repo}/{split_prefix}{matched_folder}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
                         output_files = fs.ls(output_folder, detail=False)
                     except Exception as e2:
                         stats['skipped_no_activations'] += 1
@@ -224,8 +237,14 @@ def load_trajectory_data(
                 stats['skipped_no_activations'] += 1
                 continue
             
-            # 3. Pad action sequence to max_seq_len
+            # 3. Add EOS token after action sequence and pad to max_seq_len
             action_tensor = torch.tensor(actions, dtype=torch.long)
+            
+            # Add EOS token (4) after the action sequence
+            eos_tensor = torch.tensor([EOS_TOKEN_ID], dtype=torch.long)
+            action_tensor = torch.cat([action_tensor, eos_tensor])
+            
+            # Pad to max_seq_len if needed
             if len(action_tensor) < max_seq_len:
                 padding = torch.full((max_seq_len - len(action_tensor),), PAD_TOKEN_ID, dtype=torch.long)
                 action_tensor = torch.cat([action_tensor, padding])
@@ -287,8 +306,8 @@ def main():
     parser.add_argument(
         "--max-seq-len",
         type=int,
-        default=20,
-        help="Maximum sequence length (sequences longer than this will be skipped)",
+        default=10,
+        help="Maximum sequence length INCLUDING EOS token (sequences longer than max_seq_len-1 will be skipped)",
     )
     parser.add_argument(
         "--max-trajectories",
@@ -349,6 +368,23 @@ def main():
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to train on (cuda/cpu)",
+    )
+    parser.add_argument(
+        "--test-activations-repo",
+        type=str,
+        default="project-telos/activations_test_full",
+        help="HuggingFace repository with test activations",
+    )
+    parser.add_argument(
+        "--test-trajectories-repo",
+        type=str,
+        default="project-telos/trajectories_test_full",
+        help="HuggingFace repository with test trajectory JSONs",
+    )
+    parser.add_argument(
+        "--skip-test-eval",
+        action="store_true",
+        help="Skip test evaluation after training",
     )
     
     args = parser.parse_args()
@@ -436,17 +472,100 @@ def main():
     # Save training statistics
     stats_path = args.save_path.replace('.pt', '_stats.json')
     os.makedirs(os.path.dirname(stats_path) if os.path.dirname(stats_path) else ".", exist_ok=True)
+    
+    # Evaluate on test set if not skipped
+    test_stats = None
+    test_results = None
+    if not args.skip_test_eval:
+        print(f"\n{'='*80}")
+        print("Evaluating on Test Set")
+        print(f"{'='*80}\n")
+        
+        # Load test data
+        test_dataset, test_stats = load_trajectory_data(
+            activations_repo=args.test_activations_repo,
+            trajectories_repo=args.test_trajectories_repo,
+            split='',  # Test repos don't have train/val splits, just root level
+            layer=args.layer,
+            max_trajectories=args.max_trajectories,
+            max_seq_len=args.max_seq_len,
+        )
+        
+        if len(test_dataset) > 0:
+            # Evaluate on test set
+            model.eval()
+            test_loss = 0.0
+            test_correct_tokens = 0
+            test_correct_sequences = 0
+            test_total_tokens = 0
+            test_total_sequences = 0
+            
+            with torch.no_grad():
+                for i in range(0, len(test_dataset), args.batch_size):
+                    batch = test_dataset[i:i + args.batch_size]
+                    activations = torch.stack([item[0] for item in batch]).to(args.device)
+                    targets = torch.stack([item[1] for item in batch]).to(args.device)
+                    
+                    # Forward pass
+                    logits = model(activations, targets)
+                    
+                    # Compute loss (only on non-padded tokens)
+                    mask = targets != PAD_TOKEN_ID
+                    loss = torch.nn.functional.cross_entropy(
+                        logits[mask],
+                        targets[mask],
+                        reduction='mean'
+                    )
+                    test_loss += loss.item()
+                    
+                    # Compute accuracy
+                    predictions = logits.argmax(dim=-1)
+                    test_correct_tokens += (predictions[mask] == targets[mask]).sum().item()
+                    test_total_tokens += mask.sum().item()
+                    
+                    # Sequence accuracy (all non-padded tokens correct)
+                    for pred_seq, target_seq in zip(predictions, targets):
+                        seq_mask = target_seq != PAD_TOKEN_ID
+                        if seq_mask.sum() > 0:
+                            test_correct_sequences += (pred_seq[seq_mask] == target_seq[seq_mask]).all().item()
+                            test_total_sequences += 1
+            
+            test_loss /= (len(test_dataset) / args.batch_size)
+            test_token_acc = test_correct_tokens / test_total_tokens if test_total_tokens > 0 else 0
+            test_seq_acc = test_correct_sequences / test_total_sequences if test_total_sequences > 0 else 0
+            
+            test_results = {
+                'test_loss': test_loss,
+                'test_token_accuracy': test_token_acc,
+                'test_sequence_accuracy': test_seq_acc,
+                'test_samples': len(test_dataset),
+            }
+            
+            print(f"\n{'='*80}")
+            print("Test Set Results")
+            print(f"{'='*80}")
+            print(f"  Test samples: {len(test_dataset)}")
+            print(f"  Test loss: {test_loss:.4f}")
+            print(f"  Test token accuracy: {test_token_acc:.2%}")
+            print(f"  Test sequence accuracy: {test_seq_acc:.2%}")
+            print(f"{'='*80}\n")
+        else:
+            print("WARNING: No test data loaded, skipping test evaluation.\n")
+    
+    # Save all statistics including test results
     with open(stats_path, 'w') as f:
         json.dump({
             'args': vars(args),
             'train_stats': train_stats,
             'val_stats': val_stats,
+            'test_stats': test_stats,
             'results': {
                 k: v for k, v in results.items() 
                 if not isinstance(v, list)  # Skip lists for JSON serialization
             },
+            'test_results': test_results,
         }, f, indent=2)
-    print(f"\nTraining statistics saved to {stats_path}")
+    print(f"Training statistics saved to {stats_path}")
     
     print(f"\n{'='*80}")
     print("Training Complete!")
@@ -455,6 +574,10 @@ def main():
     print(f"  Final val loss: {results['final_eval_loss']:.4f}")
     print(f"  Final token accuracy: {results['final_token_accuracy']:.4f}")
     print(f"  Final sequence accuracy: {results['final_sequence_accuracy']:.4f}")
+    if test_results:
+        print(f"  Test loss: {test_results['test_loss']:.4f}")
+        print(f"  Test token accuracy: {test_results['test_token_accuracy']:.2%}")
+        print(f"  Test sequence accuracy: {test_results['test_sequence_accuracy']:.2%}")
     print(f"  Model saved to: {args.save_path}")
     print(f"{'='*80}\n")
 

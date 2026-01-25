@@ -1,4 +1,42 @@
-# Action Sequence Processing Scripts
+# Telos Interp Scripts
+
+This directory contains scripts for training, evaluating, and analyzing decoder probes for action sequence prediction.
+
+## evaluate_sequence_length_prediction.py
+
+**NEW**: Evaluates the accuracy of a trained decoder probe on predicting sequence lengths (number of actions) compared to ground truth.
+
+### Quick Start
+
+```bash
+# Download model and evaluate on all grid sizes
+python scripts/evaluate_sequence_length_prediction.py \
+    --hf-model-repo project-telos/interp \
+    --hf-model-file decoder_reasoning_probe/decoder_probe_layer15_full.pt \
+    --layer 15 \
+    --grid-sizes 7 9 11 13 15 \
+    --output results/length_prediction_results.json
+```
+
+### What It Does
+
+1. Downloads/loads the trained reasoning probe
+2. Loads test trajectories from HuggingFace to get ground truth sequence lengths
+3. Loads activations and runs the probe to predict action sequences
+4. Compares predicted lengths vs ground truth lengths
+5. Reports metrics: MAE, RMSE, accuracy, correlation, error distribution
+
+### Key Metrics
+
+- **MAE**: Mean Absolute Error between predicted and true lengths
+- **RMSE**: Root Mean Squared Error
+- **Exact Match Accuracy**: % where predicted length exactly equals ground truth
+- **Within-1/2 Accuracy**: % where prediction is within 1 or 2 steps
+- **Correlation**: Pearson correlation between predicted and true lengths
+
+See [SEQUENCE_LENGTH_EVALUATION.md](./SEQUENCE_LENGTH_EVALUATION.md) for detailed documentation.
+
+---
 
 ## process_action_sequences.py
 
