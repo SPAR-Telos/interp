@@ -7,6 +7,8 @@ matches them by trajectory name, and trains the decoder probe.
 import argparse
 import json
 import os
+import tarfile
+import tempfile
 from pathlib import Path
 
 import torch
@@ -27,6 +29,45 @@ ACTION_MAP = {
     "UP": 2,
     "DOWN": 3,
 }
+
+
+def download_and_extract_tar(repo_id: str, tar_filename: str, extract_dir: Path) -> Path:
+    """Download and extract a tar file from HuggingFace.
+    
+    Args:
+        repo_id: HuggingFace repo ID
+        tar_filename: Name of the tar file (e.g., 'trajectories_test_full.tar')
+        extract_dir: Directory to extract to
+        
+    Returns:
+        Path to extracted directory
+    """
+    # Download tar file
+    print(f"  Downloading {tar_filename} from {repo_id}...")
+    tar_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=tar_filename,
+        repo_type='dataset',
+    )
+    
+    # Extract tar file
+    extract_path = extract_dir / tar_filename.replace('.tar', '')
+    if not extract_path.exists():
+        print(f"  Extracting {tar_filename}...")
+        extract_path.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tar_path, 'r') as tar:
+            tar.extractall(path=extract_path)
+        print(f"  ✓ Extracted to {extract_path}")
+    else:
+        print(f"  ✓ Already extracted at {extract_path}")
+    
+    # The tar file extracts to a nested directory with the same name
+    # Check if there's a nested directory
+    nested_path = extract_path / tar_filename.replace('.tar', '')
+    if nested_path.exists():
+        return nested_path
+    
+    return extract_path
 
 
 def extract_action_sequence_from_json(trajectory_data: dict) -> list[int]:
@@ -87,16 +128,52 @@ def load_trajectory_data(
     print(f"  Max sequence length: {max_seq_len}")
     print(f"{'='*80}\n")
     
-    # List trajectory JSON files to get trajectory names
+    # Check if repos contain tar archives (test data format)
     fs = HfFileSystem()
-    # Handle both split subdirectories (train/val) and root-level files (test)
-    if split:
-        traj_path = f"datasets/{trajectories_repo}/{split}"
+    repo_root = f"datasets/{trajectories_repo}"
+    repo_files = fs.ls(repo_root, detail=False)
+    tar_files = [f for f in repo_files if f.endswith('.tar')]
+    
+    use_tar_format = len(tar_files) > 0
+    
+    if use_tar_format:
+        # Extract tar archives to temp directory
+        print("Detected tar archive format, extracting...")
+        extract_dir = Path(tempfile.gettempdir()) / "hf_extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract trajectory tar
+        traj_tar_name = Path(trajectories_repo).name + '.tar'
+        traj_extracted = download_and_extract_tar(trajectories_repo, traj_tar_name, extract_dir)
+        
+        # Extract activations tar
+        act_tar_name = Path(activations_repo).name + '.tar'
+        act_extracted = download_and_extract_tar(activations_repo, act_tar_name, extract_dir)
+        
+        # List all JSON files from all size folders
+        json_files = []
+        for size_dir in traj_extracted.glob('size*'):
+            json_files.extend(list(size_dir.glob('*.json')))
+        json_files = [str(f) for f in json_files]
+        print(f"Found {len(json_files)} trajectory files in extracted archives")
+        
+        # Store paths for later use
+        local_traj_base = traj_extracted
+        local_act_base = act_extracted
     else:
-        traj_path = f"datasets/{trajectories_repo}"
-    print(f"Listing trajectory files from {traj_path}...")
-    traj_files = fs.ls(traj_path, detail=False)
-    json_files = [f for f in traj_files if f.endswith('.json')]
+        # Use HfFileSystem for train/val split data
+        # Handle both split subdirectories (train/val) and root-level files (test)
+        if split:
+            traj_path = f"datasets/{trajectories_repo}/{split}"
+        else:
+            traj_path = f"datasets/{trajectories_repo}"
+        print(f"Listing trajectory files from {traj_path}...")
+        traj_files = fs.ls(traj_path, detail=False)
+        json_files = [f for f in traj_files if f.endswith('.json')]
+        print(f"Found {len(json_files)} trajectory files")
+        
+        local_traj_base = None
+        local_act_base = None
     
     if max_trajectories is not None:
         json_files = json_files[:max_trajectories]
@@ -114,16 +191,20 @@ def load_trajectory_data(
         'sequence_lengths': [],
     }
     
-    for json_file_path in tqdm(json_files, desc=f"Loading {split} data"):
+    for json_file_path in tqdm(json_files, desc=f"Loading {split if split else 'test'} data"):
         # Extract trajectory name from path
-        # e.g., "datasets/project-telos/train_and_val_full_trajectories/train/together_ai_openai_gpt-oss-20b_size11_comp0.0_0.json"
-        # -> "together_ai_openai_gpt-oss-20b_size11_comp0.0_0"
         traj_name = Path(json_file_path).stem
         
         try:
             # 1. Load action sequence from JSON
-            with fs.open(json_file_path, 'r') as f:
-                content = f.read()
+            if use_tar_format:
+                # Read from local extracted file
+                with open(json_file_path, 'r') as f:
+                    content = f.read()
+            else:
+                # Read from HuggingFace
+                with fs.open(json_file_path, 'r') as f:
+                    content = f.read()
             
             if not content or content.strip() == '':
                 stats['skipped_parse_error'] += 1
@@ -144,84 +225,110 @@ def load_trajectory_data(
                 continue
             
             # 2. Load all activations from step_0/output folder
-            # Path pattern: {split}/{traj_name}/openai__gpt-oss-20b/layer_{layer}/step_0/output/*.pt
-            # Note: activation folder may have suffix (e.g., _from_missing1), so we try exact match first,
-            # then look for folders starting with traj_name
             activation_tensors = []
             try:
-                # Construct paths based on whether split is provided
-                if split:
-                    split_prefix = f"{split}/"
-                else:
-                    split_prefix = ""
-                
-                # Try exact match first
-                output_folder = f"datasets/{activations_repo}/{split_prefix}{traj_name}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
-                output_files = None
-                
-                try:
-                    output_files = fs.ls(output_folder, detail=False)
-                except Exception as e:
-                    # Exact match failed, try prefix match
-                    # List all folders in split directory and find one starting with traj_name
-                    split_path = f"datasets/{activations_repo}/{split}" if split else f"datasets/{activations_repo}"
-                    try:
-                        all_folders = fs.ls(split_path, detail=False)
-                        matching_folders = [
-                            f for f in all_folders 
-                            if f.split('/')[-1].startswith(traj_name)
-                        ]
-                        
-                        if len(matching_folders) == 0:
+                if use_tar_format:
+                    # Load from extracted tar archive (local filesystem)
+                    # Find the size folder this trajectory belongs to
+                    json_path = Path(json_file_path)
+                    size_folder = json_path.parent.name  # e.g., "size11"
+                    
+                    # Construct path to activations
+                    # Pattern: size11/traj_name/openai__gpt-oss-20b/layer_{layer}/step_0/output/*.pt
+                    act_traj_dir = local_act_base / size_folder / traj_name / "openai__gpt-oss-20b" / f"layer_{layer}" / "step_0" / "output"
+                    
+                    if not act_traj_dir.exists():
+                        # Try with suffix (e.g., _from_missing1)
+                        parent_dir = local_act_base / size_folder
+                        matching_dirs = list(parent_dir.glob(f"{traj_name}*"))
+                        if not matching_dirs:
                             stats['skipped_no_activations'] += 1
                             continue
+                        # Use the first match (prefer exact match by sorting by length)
+                        matching_dirs = sorted(matching_dirs, key=lambda x: len(x.name))
+                        act_traj_dir = matching_dirs[0] / "openai__gpt-oss-20b" / f"layer_{layer}" / "step_0" / "output"
                         
-                        # Use the first matching folder (prefer exact match if multiple)
-                        # Sort to prioritize exact matches (shorter names)
-                        matching_folders = sorted(matching_folders, key=lambda x: len(x))
-                        matched_folder = matching_folders[0].split('/')[-1]
-                        
-                        output_folder = f"datasets/{activations_repo}/{split_prefix}{matched_folder}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
-                        output_files = fs.ls(output_folder, detail=False)
-                    except Exception as e2:
+                        if not act_traj_dir.exists():
+                            stats['skipped_no_activations'] += 1
+                            continue
+                    
+                    # Load all .pt files from the output directory
+                    pt_files = sorted(list(act_traj_dir.glob('*.pt')), key=lambda x: int(x.stem))
+                    
+                    if len(pt_files) == 0:
                         stats['skipped_no_activations'] += 1
                         continue
-                
-                if output_files is None or len(output_files) == 0:
-                    stats['skipped_no_activations'] += 1
-                    continue
-                # Filter for .pt files and sort by token position
-                pt_files = [f for f in output_files if f.endswith('.pt')]
-                
-                if len(pt_files) == 0:
-                    stats['skipped_no_activations'] += 1
-                    continue
-                
-                pt_files = sorted(pt_files, key=lambda x: int(Path(x).stem))
-                
-                # Load each activation file
-                for pt_file in pt_files:
-                    # Extract the relative path from the repo
-                    # pt_file is like: "datasets/{repo_id}/{split}/{traj}/..."
-                    # We need: "{split}/{traj}/openai__gpt-oss-20b/layer_{layer}/step_0/output/{num}.pt"
-                    parts = pt_file.split('/')
-                    # Find where the split starts (after repo name)
-                    repo_parts = activations_repo.split('/')
-                    split_idx = len(['datasets'] + repo_parts)  # datasets/project-telos/train_and_val_activations = 3 parts before split
-                    filename = '/'.join(parts[split_idx:])  # Everything after the repo name
                     
-                    act_path = hf_hub_download(
-                        repo_id=activations_repo,
-                        filename=filename,
-                        repo_type='dataset',
-                    )
-                    act_tensor = torch.load(act_path, weights_only=True)
+                    for pt_file in pt_files:
+                        act_tensor = torch.load(pt_file, weights_only=True)
+                        if act_tensor.ndim > 1:
+                            act_tensor = act_tensor.squeeze()
+                        activation_tensors.append(act_tensor)
+                
+                else:
+                    # Load from HuggingFace (remote)
+                    # Construct paths based on whether split is provided
+                    if split:
+                        split_prefix = f"{split}/"
+                    else:
+                        split_prefix = ""
                     
-                    # Ensure it's 1D
-                    if act_tensor.ndim > 1:
-                        act_tensor = act_tensor.squeeze()
+                    # Try exact match first
+                    output_folder = f"datasets/{activations_repo}/{split_prefix}{traj_name}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
+                    output_files = None
                     
-                    activation_tensors.append(act_tensor)
+                    try:
+                        output_files = fs.ls(output_folder, detail=False)
+                    except Exception as e:
+                        # Exact match failed, try prefix match
+                        split_path = f"datasets/{activations_repo}/{split}" if split else f"datasets/{activations_repo}"
+                        try:
+                            all_folders = fs.ls(split_path, detail=False)
+                            matching_folders = [
+                                f for f in all_folders 
+                                if f.split('/')[-1].startswith(traj_name)
+                            ]
+                            
+                            if len(matching_folders) == 0:
+                                stats['skipped_no_activations'] += 1
+                                continue
+                            
+                            matching_folders = sorted(matching_folders, key=lambda x: len(x))
+                            matched_folder = matching_folders[0].split('/')[-1]
+                            
+                            output_folder = f"datasets/{activations_repo}/{split_prefix}{matched_folder}/openai__gpt-oss-20b/layer_{layer}/step_0/output"
+                            output_files = fs.ls(output_folder, detail=False)
+                        except Exception as e2:
+                            stats['skipped_no_activations'] += 1
+                            continue
+                    
+                    if output_files is None or len(output_files) == 0:
+                        stats['skipped_no_activations'] += 1
+                        continue
+                    
+                    pt_files = [f for f in output_files if f.endswith('.pt')]
+                    if len(pt_files) == 0:
+                        stats['skipped_no_activations'] += 1
+                        continue
+                    
+                    pt_files = sorted(pt_files, key=lambda x: int(Path(x).stem))
+                    
+                    # Download and load each activation file
+                    for pt_file in pt_files:
+                        parts = pt_file.split('/')
+                        repo_parts = activations_repo.split('/')
+                        split_idx = len(['datasets'] + repo_parts)
+                        filename = '/'.join(parts[split_idx:])
+                        
+                        act_path = hf_hub_download(
+                            repo_id=activations_repo,
+                            filename=filename,
+                            repo_type='dataset',
+                        )
+                        act_tensor = torch.load(act_path, weights_only=True)
+                        if act_tensor.ndim > 1:
+                            act_tensor = act_tensor.squeeze()
+                        activation_tensors.append(act_tensor)
                 
                 # Stack activations into (num_tokens, activation_dim)
                 activations = torch.stack(activation_tensors, dim=0)
