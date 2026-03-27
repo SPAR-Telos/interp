@@ -27,6 +27,36 @@ The typical workflow follows these steps:
 
 ## Commands
 
+### activation_patch_counterfactuals
+
+Run online activation patching between original and counterfactual trajectories.
+
+```bash
+interp-cli activation_patch_counterfactuals \
+    --layers 7,15,23 \
+    --patch-sites prompt_boundary,pre_final_boundary \
+    --output-dir data/activation_patching
+```
+
+**Key options:**
+| Option | Description |
+|--------|-------------|
+| `--counterfactual-metadata-root` | Root directory with counterfactual grid metadata |
+| `--counterfactual-trajectories-dir` | Directory with generated counterfactual trajectories |
+| `--original-trajectories-dir` | Directory with original trajectories |
+| `--patch-sites` | Boundary sites to patch (`prompt_boundary`, `pre_final_boundary`) |
+| `--layers` | Layer indices to evaluate |
+| `--output-dir` | Directory for manifest and statistics outputs |
+
+Artifacts written:
+- `manifest.json`
+- `runs.jsonl`
+- `summary_by_group.csv`
+
+See [`activation_patch_counterfactuals/README.md`](activation_patch_counterfactuals/README.md) for details.
+
+---
+
 ### gather_activations
 
 Extract model activations from trajectory JSON files.

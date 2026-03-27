@@ -4,6 +4,7 @@ import logging
 
 import tyro
 
+from telos_interp.commands.activation_patch_counterfactuals import activation_patch_counterfactuals
 from telos_interp.commands.apply_cognitive_map_probe import apply_cognitive_map_probe
 from telos_interp.commands.eval_cognitive_map_probe import eval_cognitive_map_probe
 from telos_interp.commands.eval_distance_probe import eval_distance_probe
@@ -18,6 +19,7 @@ def main():
 
     Configures logging and sets up the CLI with available subcommands using tyro.
     Currently supports the following subcommands:
+    - activation_patch_counterfactuals: Patch online activations between original and counterfactual runs
     - gather_activations: Gather model activations from various data formats
     - train_distance_probe: Train and apply distance regression probes
     - prepare_activations_for_probing: Extract and concatenate activations for cognitive map probing
@@ -28,6 +30,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     tyro.extras.subcommand_cli_from_dict(
         {
+            "activation_patch_counterfactuals": activation_patch_counterfactuals,
             "gather_activations": gather_activations,
             "train_distance_probe": train_distance_probe,
             "eval_distance_probe": eval_distance_probe,
