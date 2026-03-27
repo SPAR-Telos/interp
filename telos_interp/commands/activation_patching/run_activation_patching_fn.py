@@ -117,7 +117,6 @@ def run_activation_patching():
     with open(corrupted_filename) as f:
         corrupted_trajectory = json.load(f)
 
-
     corrupted_answer_forcing_input_ids, corrupted_answer_forcing_input_string = get_answer_forcing_input(
         corrupted_trajectory, tokenizer
     )
@@ -155,7 +154,6 @@ def run_activation_patching():
     clean_hs = []
     with nnsight_model.trace() as tracer:
         with tracer.invoke(clean_prompt):
-
             # Get hidden states of all layers in the network.
             # We index the output at 0 because it's a tuple where the first index is the hidden state.
             for layer_idx in range(N_LAYERS):

@@ -546,7 +546,7 @@ def prepare_activations_for_probing(
 
     # For distance probes, enforce steps="0" since astar_distance is only valid for step 0
     if probe_type == "distance" and steps != "0":
-        print(f"WARNING: probe_type='distance' requires steps='0' (astar_distance is only valid for initial state).")
+        print("WARNING: probe_type='distance' requires steps='0' (astar_distance is only valid for initial state).")
         print(f"         Overriding steps='{steps}' to steps='0'")
         steps = "0"
 
