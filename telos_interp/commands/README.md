@@ -53,6 +53,8 @@ Artifacts written:
 - `runs.jsonl`
 - `summary_by_group.csv`
 
+If `runs.jsonl` already exists in the output directory, the command resumes automatically and skips completed runs.
+
 See [`activation_patch_counterfactuals/README.md`](activation_patch_counterfactuals/README.md) for details.
 
 ---

@@ -21,3 +21,5 @@ Artifacts:
 - `manifest.json`
 - `runs.jsonl`
 - `summary_by_group.csv`
+
+If `runs.jsonl` already exists in `--output-dir`, the command resumes automatically and skips completed `counterfactual_id × step × direction × patch_site × layer` runs. New records are appended as they finish.

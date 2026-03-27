@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -233,7 +235,7 @@ def _generate_tokens_with_optional_patch(
                         raise ValueError("layer must be provided when donor_activations are supplied.")
                     device = model.layers_output[layer].device
                     model.layers_output[layer][0, absolute_positions, :] = donor_activations.to(device)
-                generated_ids = model.generator.output.save()
+                generated_ids = tracer.result.save()
 
     return generated_ids.detach().cpu()
 
@@ -527,6 +529,46 @@ def _build_summary_dataframe(run_records: list[dict[str, Any]]) -> pd.DataFrame:
     return summary
 
 
+def _mean_numeric(records: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(record[key]) for record in records if record.get(key) is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _build_timing_summary(run_records: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    return {
+        "avg_run_wall_time_seconds": _mean_numeric(run_records, "run_wall_time_seconds"),
+        "avg_baseline_generation_seconds": _mean_numeric(run_records, "baseline_generation_seconds"),
+        "avg_donor_capture_seconds": _mean_numeric(run_records, "donor_capture_seconds"),
+        "avg_patched_generation_seconds": _mean_numeric(run_records, "patched_generation_seconds"),
+        "baseline_cache_miss_count": int(
+            sum(1 for record in run_records if (record.get("baseline_generation_seconds") or 0.0) > 0)
+        ),
+        "donor_cache_miss_count": int(
+            sum(1 for record in run_records if (record.get("donor_capture_seconds") or 0.0) > 0)
+        ),
+    }
+
+
+def _format_tqdm_postfix(run_records: list[dict[str, Any]], expected_total_runs: int) -> dict[str, str]:
+    timing = _build_timing_summary(run_records)
+    completed_runs = len(run_records)
+    error_count = int(sum(record["error"] is not None for record in run_records))
+
+    def _fmt(value: float | None) -> str:
+        return "-" if value is None else f"{value:.1f}s"
+
+    return {
+        "runs": f"{completed_runs}/{expected_total_runs}",
+        "run": _fmt(timing["avg_run_wall_time_seconds"]),
+        "base": _fmt(timing["avg_baseline_generation_seconds"]),
+        "donor": _fmt(timing["avg_donor_capture_seconds"]),
+        "patch": _fmt(timing["avg_patched_generation_seconds"]),
+        "err": str(error_count),
+    }
+
+
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     with path.open("w") as f:
         for record in records:
@@ -534,7 +576,142 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             f.write("\n")
 
 
-def activation_patch_counterfactuals(
+def _append_jsonl_record(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a") as f:
+        f.write(json.dumps(record))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _make_run_key(
+    pair: PatchPair,
+    direction: str,
+    patch_site: str,
+    layer: int,
+) -> str:
+    return "|".join(
+        [
+            pair.counterfactual_id,
+            str(pair.source_step_id),
+            direction,
+            patch_site,
+            str(layer),
+        ]
+    )
+
+
+def _load_existing_runs(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    runs: list[dict[str, Any]] = []
+    with path.open() as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            runs.append(json.loads(stripped))
+    return runs
+
+
+def _failed_generation_result(
+    *,
+    absolute_positions: list[int] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "output_text": "",
+        "action": None,
+        "parse_failure": True,
+        "input_token_count": None,
+        "generated_token_count": None,
+        "absolute_positions": absolute_positions,
+        "error": error,
+    }
+
+
+def _build_manifest(
+    *,
+    model_id: str,
+    counterfactual_metadata_root: str,
+    counterfactual_trajectories_dir: str,
+    original_trajectories_dir: str,
+    selected_patch_sites: list[str],
+    layer_indices: list[int],
+    selected_directions: list[str],
+    counterfactual_types: str,
+    relations: str,
+    grid_sizes: str,
+    complexities: str,
+    max_examples: int | None,
+    output_dir: str,
+    device_map: str,
+    torch_dtype: str,
+    overwrite: bool,
+    verbose: bool,
+    pairs: list[PatchPair],
+    discovery_skips: list[dict[str, Any]],
+    manifest_path: Path,
+    runs_path: Path,
+    summary_path: Path,
+    runs: list[dict[str, Any]],
+    expected_total_runs: int,
+    resumed_run_count: int,
+) -> dict[str, Any]:
+    return {
+        "command": "activation_patch_counterfactuals",
+        "model_id": model_id,
+        "git_sha": _get_git_sha(),
+        "args": {
+            "counterfactual_metadata_root": counterfactual_metadata_root,
+            "counterfactual_trajectories_dir": counterfactual_trajectories_dir,
+            "original_trajectories_dir": original_trajectories_dir,
+            "patch_sites": selected_patch_sites,
+            "layers": layer_indices,
+            "directions": selected_directions,
+            "counterfactual_types": counterfactual_types,
+            "relations": relations,
+            "grid_sizes": grid_sizes,
+            "complexities": complexities,
+            "max_examples": max_examples,
+            "output_dir": output_dir,
+            "device_map": device_map,
+            "torch_dtype": torch_dtype,
+            "overwrite": overwrite,
+            "verbose": verbose,
+        },
+        "discovery": {
+            "pair_count": len(pairs),
+            "skipped_pairs": discovery_skips,
+        },
+        "artifacts": {
+            "manifest_path": str(manifest_path),
+            "runs_path": str(runs_path),
+            "summary_path": str(summary_path),
+        },
+        "progress": {
+            "expected_total_runs": expected_total_runs,
+            "completed_run_count": len(runs),
+            "remaining_run_count": max(expected_total_runs - len(runs), 0),
+            "resumed_run_count": resumed_run_count,
+        },
+        "run_counts": {
+            "total_runs": len(runs),
+            "success_primary_count": int(sum(record["success_primary"] for record in runs)),
+            "parse_failure_count": int(sum(record["parse_failure"] for record in runs)),
+            "error_count": int(sum(record["error"] is not None for record in runs)),
+        },
+        "timing": _build_timing_summary(runs),
+    }
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    with path.open("w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def activation_patch_counterfactuals(  # noqa: PLR0912
     counterfactual_metadata_root: str = "data/counterfactual_grids",
     counterfactual_trajectories_dir: str = "data/counterfactual_trajectories",
     original_trajectories_dir: str = "data/trajectories_test_full",
@@ -576,8 +753,20 @@ def activation_patch_counterfactuals(
     manifest_path = output_dir_path / "manifest.json"
     runs_path = output_dir_path / "runs.jsonl"
     summary_path = output_dir_path / "summary_by_group.csv"
-    if not overwrite and (manifest_path.exists() or runs_path.exists() or summary_path.exists()):
-        raise FileExistsError(f"Output files already exist in {output_dir_path}. Pass overwrite=True to replace them.")
+    if overwrite:
+        for path in (manifest_path, runs_path, summary_path):
+            if path.exists():
+                path.unlink()
+        existing_runs: list[dict[str, Any]] = []
+    elif runs_path.exists():
+        existing_runs = _load_existing_runs(runs_path)
+    else:
+        existing_runs = []
+        if manifest_path.exists() or summary_path.exists():
+            raise FileExistsError(
+                f"Found partial outputs in {output_dir_path} without runs.jsonl. "
+                "Pass overwrite=True to replace them."
+            )
 
     first_original = _load_json(Path(pairs[0].original_trajectory_path))
     model_id = first_original["model_params"]["model_id"]
@@ -586,14 +775,59 @@ def activation_patch_counterfactuals(
 
     try:
         layer_indices = parse_index_specification(layers, model.config.num_hidden_layers)
+        expected_total_runs = len(pairs) * len(selected_directions) * len(selected_patch_sites) * len(layer_indices)
+        completed_run_keys = {
+            record.get("run_key")
+            or "|".join(
+                [
+                    str(record["counterfactual_id"]),
+                    str(record["step_idx"]),
+                    str(record["direction"]),
+                    str(record["patch_site"]),
+                    str(record["layer"]),
+                ]
+            )
+            for record in existing_runs
+        }
         if verbose:
             print(f"Discovered {len(pairs)} patch pairs")
             print(f"Selected layers: {layer_indices}")
             print(f"Selected patch sites: {selected_patch_sites}")
+            if existing_runs:
+                print(f"Resuming from {len(existing_runs)} existing runs")
 
-        runs: list[dict[str, Any]] = []
+        runs: list[dict[str, Any]] = list(existing_runs)
         donor_cache: dict[tuple[str, str, int, int], dict[str, Any]] = {}
         baseline_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
+
+        manifest = _build_manifest(
+            model_id=model_id,
+            counterfactual_metadata_root=counterfactual_metadata_root,
+            counterfactual_trajectories_dir=counterfactual_trajectories_dir,
+            original_trajectories_dir=original_trajectories_dir,
+            selected_patch_sites=selected_patch_sites,
+            layer_indices=layer_indices,
+            selected_directions=selected_directions,
+            counterfactual_types=counterfactual_types,
+            relations=relations,
+            grid_sizes=grid_sizes,
+            complexities=complexities,
+            max_examples=max_examples,
+            output_dir=output_dir,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            overwrite=overwrite,
+            verbose=verbose,
+            pairs=pairs,
+            discovery_skips=discovery_skips,
+            manifest_path=manifest_path,
+            runs_path=runs_path,
+            summary_path=summary_path,
+            runs=runs,
+            expected_total_runs=expected_total_runs,
+            resumed_run_count=len(existing_runs),
+        )
+        _write_manifest(manifest_path, manifest)
 
         pair_iterator = tqdm(pairs, desc="Patch pairs") if verbose else pairs
         for pair in pair_iterator:
@@ -622,6 +856,14 @@ def activation_patch_counterfactuals(
 
                 source_trajectory = trajectory_by_label[source_label]
                 target_trajectory = trajectory_by_label[target_label]
+                source_path = (
+                    pair.original_trajectory_path if source_label == "original" else pair.counterfactual_trajectory_path
+                )
+                target_path = (
+                    pair.counterfactual_trajectory_path
+                    if target_label == "counterfactual"
+                    else pair.original_trajectory_path
+                )
 
                 source_optimal_actions = (
                     pair.original_optimal_actions
@@ -638,62 +880,110 @@ def activation_patch_counterfactuals(
                 target_recorded_action = _extract_recorded_action(target_trajectory, pair.source_step_id)
 
                 for patch_site in selected_patch_sites:
-                    baseline_key = (
-                        target_label == "original"
-                        and pair.original_trajectory_path
-                        or pair.counterfactual_trajectory_path,
-                        patch_site,
-                        pair.source_step_id,
-                    )
+                    baseline_key = (target_path, patch_site, pair.source_step_id)
+                    baseline_cache_missed = baseline_key not in baseline_cache
                     if baseline_key not in baseline_cache:
-                        baseline_cache[baseline_key] = _run_target_generation(
-                            model=model,
-                            trajectory=target_trajectory,
-                            step_idx=pair.source_step_id,
-                            patch_site=patch_site,
-                        )
-
-                    baseline_result = baseline_cache[baseline_key]
-
-                    for layer in layer_indices:
-                        donor_key = (
-                            source_label == "original"
-                            and pair.original_trajectory_path
-                            or pair.counterfactual_trajectory_path,
-                            patch_site,
-                            pair.source_step_id,
-                            layer,
-                        )
-                        if donor_key not in donor_cache:
-                            donor_cache[donor_key] = _capture_donor_activations(
-                                model=model,
-                                trajectory=source_trajectory,
-                                step_idx=pair.source_step_id,
-                                patch_site=patch_site,
-                                layer=layer,
-                            )
-
-                        donor_result = donor_cache[donor_key]
                         try:
-                            patched_result = _run_target_generation(
+                            baseline_started_at = perf_counter()
+                            baseline_cache[baseline_key] = _run_target_generation(
                                 model=model,
                                 trajectory=target_trajectory,
                                 step_idx=pair.source_step_id,
                                 patch_site=patch_site,
-                                layer=layer,
-                                donor_activations=donor_result["activations"],
-                            )
-                            error_message = None
-                        except Exception as exc:  # noqa: BLE001
-                            patched_result = {
-                                "output_text": "",
-                                "action": None,
-                                "parse_failure": True,
-                                "input_token_count": None,
-                                "generated_token_count": None,
-                                "absolute_positions": donor_result["absolute_positions"],
+                            ) | {
+                                "error": None,
+                                "baseline_generation_seconds": perf_counter() - baseline_started_at,
                             }
-                            error_message = str(exc)
+                        except Exception as exc:  # noqa: BLE001
+                            baseline_cache[baseline_key] = _failed_generation_result(error=str(exc)) | {
+                                "baseline_generation_seconds": perf_counter() - baseline_started_at,
+                            }
+
+                    baseline_result = baseline_cache[baseline_key]
+                    baseline_generation_seconds = (
+                        float(baseline_result.get("baseline_generation_seconds") or 0.0)
+                        if baseline_cache_missed
+                        else 0.0
+                    )
+
+                    for layer in layer_indices:
+                        run_started_at = perf_counter()
+                        run_key = _make_run_key(pair, direction, patch_site, layer)
+                        if run_key in completed_run_keys:
+                            continue
+
+                        donor_key = (source_path, patch_site, pair.source_step_id, layer)
+                        error_messages: list[str] = []
+                        donor_capture_seconds = 0.0
+                        patched_generation_seconds = 0.0
+
+                        if baseline_result["error"] is not None:
+                            donor_result = {
+                                "absolute_positions": None,
+                                "input_token_count": None,
+                                "error": None,
+                                "donor_capture_seconds": 0.0,
+                            }
+                            patched_result = _failed_generation_result(error=baseline_result["error"]) | {
+                                "patched_generation_seconds": 0.0,
+                            }
+                            error_messages.append(f"baseline_generation_failed: {baseline_result['error']}")
+                        else:
+                            donor_cache_missed = donor_key not in donor_cache
+                            if donor_key not in donor_cache:
+                                try:
+                                    donor_started_at = perf_counter()
+                                    donor_cache[donor_key] = _capture_donor_activations(
+                                        model=model,
+                                        trajectory=source_trajectory,
+                                        step_idx=pair.source_step_id,
+                                        patch_site=patch_site,
+                                        layer=layer,
+                                    ) | {
+                                        "error": None,
+                                        "donor_capture_seconds": perf_counter() - donor_started_at,
+                                    }
+                                except Exception as exc:  # noqa: BLE001
+                                    donor_cache[donor_key] = {
+                                        "activations": None,
+                                        "absolute_positions": None,
+                                        "input_token_count": None,
+                                        "error": str(exc),
+                                        "donor_capture_seconds": perf_counter() - donor_started_at,
+                                    }
+
+                            donor_result = donor_cache[donor_key]
+                            donor_capture_seconds = (
+                                float(donor_result.get("donor_capture_seconds") or 0.0) if donor_cache_missed else 0.0
+                            )
+                            if donor_result["error"] is not None:
+                                patched_result = _failed_generation_result(error=donor_result["error"]) | {
+                                    "patched_generation_seconds": 0.0,
+                                }
+                                error_messages.append(f"donor_capture_failed: {donor_result['error']}")
+                            else:
+                                try:
+                                    patched_started_at = perf_counter()
+                                    patched_result = _run_target_generation(
+                                        model=model,
+                                        trajectory=target_trajectory,
+                                        step_idx=pair.source_step_id,
+                                        patch_site=patch_site,
+                                        layer=layer,
+                                        donor_activations=donor_result["activations"],
+                                    ) | {
+                                        "error": None,
+                                        "patched_generation_seconds": perf_counter() - patched_started_at,
+                                    }
+                                except Exception as exc:  # noqa: BLE001
+                                    patched_result = _failed_generation_result(
+                                        absolute_positions=donor_result["absolute_positions"],
+                                        error=str(exc),
+                                    ) | {"patched_generation_seconds": perf_counter() - patched_started_at}
+                                    error_messages.append(f"patched_generation_failed: {exc}")
+                                patched_generation_seconds = float(
+                                    patched_result.get("patched_generation_seconds") or 0.0
+                                )
 
                         outcome_flags = compute_outcome_flags(
                             direction=direction,
@@ -714,18 +1004,15 @@ def activation_patch_counterfactuals(
                             "requested_instance_id": pair.requested_instance_id,
                             "actual_instance_id": pair.actual_instance_id,
                             "source_filename": pair.source_filename,
+                            "run_key": run_key,
                             "direction": direction,
                             "source_label": source_label,
                             "target_label": target_label,
                             "patch_site": patch_site,
                             "layer": layer,
                             "step_idx": pair.source_step_id,
-                            "source_trajectory_path": pair.original_trajectory_path
-                            if source_label == "original"
-                            else pair.counterfactual_trajectory_path,
-                            "target_trajectory_path": pair.counterfactual_trajectory_path
-                            if target_label == "counterfactual"
-                            else pair.original_trajectory_path,
+                            "source_trajectory_path": source_path,
+                            "target_trajectory_path": target_path,
                             "source_recorded_action": source_recorded_action,
                             "target_recorded_action": target_recorded_action,
                             "baseline_target_action": baseline_result["action"],
@@ -734,7 +1021,14 @@ def activation_patch_counterfactuals(
                             "target_optimal_actions": list(target_optimal_actions),
                             "baseline_parse_failure": bool(baseline_result["parse_failure"]),
                             "parse_failure": bool(patched_result["parse_failure"]),
-                            "error": error_message,
+                            "baseline_error": baseline_result["error"],
+                            "donor_error": donor_result.get("error"),
+                            "patched_error": patched_result["error"],
+                            "error": "; ".join(error_messages) or None,
+                            "run_wall_time_seconds": perf_counter() - run_started_at,
+                            "baseline_generation_seconds": baseline_generation_seconds,
+                            "donor_capture_seconds": donor_capture_seconds,
+                            "patched_generation_seconds": patched_generation_seconds,
                             "baseline_input_token_count": baseline_result["input_token_count"],
                             "patched_input_token_count": patched_result["input_token_count"],
                             "baseline_generated_token_count": baseline_result["generated_token_count"],
@@ -745,52 +1039,72 @@ def activation_patch_counterfactuals(
                             **outcome_flags,
                         }
                         runs.append(run_record)
+                        completed_run_keys.add(run_key)
+                        _append_jsonl_record(runs_path, run_record)
+                        if verbose and hasattr(pair_iterator, "set_postfix") and len(runs) % 5 == 0:
+                            pair_iterator.set_postfix(_format_tqdm_postfix(runs, expected_total_runs))
+                        manifest = _build_manifest(
+                            model_id=model_id,
+                            counterfactual_metadata_root=counterfactual_metadata_root,
+                            counterfactual_trajectories_dir=counterfactual_trajectories_dir,
+                            original_trajectories_dir=original_trajectories_dir,
+                            selected_patch_sites=selected_patch_sites,
+                            layer_indices=layer_indices,
+                            selected_directions=selected_directions,
+                            counterfactual_types=counterfactual_types,
+                            relations=relations,
+                            grid_sizes=grid_sizes,
+                            complexities=complexities,
+                            max_examples=max_examples,
+                            output_dir=output_dir,
+                            device_map=device_map,
+                            torch_dtype=torch_dtype,
+                            overwrite=overwrite,
+                            verbose=verbose,
+                            pairs=pairs,
+                            discovery_skips=discovery_skips,
+                            manifest_path=manifest_path,
+                            runs_path=runs_path,
+                            summary_path=summary_path,
+                            runs=runs,
+                            expected_total_runs=expected_total_runs,
+                            resumed_run_count=len(existing_runs),
+                        )
+                        _write_manifest(manifest_path, manifest)
+
+            if verbose and hasattr(pair_iterator, "set_postfix"):
+                pair_iterator.set_postfix(_format_tqdm_postfix(runs, expected_total_runs))
 
         summary_df = _build_summary_dataframe(runs)
-        _write_jsonl(runs_path, runs)
         summary_df.to_csv(summary_path, index=False)
-
-        manifest = {
-            "command": "activation_patch_counterfactuals",
-            "model_id": model_id,
-            "git_sha": _get_git_sha(),
-            "args": {
-                "counterfactual_metadata_root": counterfactual_metadata_root,
-                "counterfactual_trajectories_dir": counterfactual_trajectories_dir,
-                "original_trajectories_dir": original_trajectories_dir,
-                "patch_sites": selected_patch_sites,
-                "layers": layer_indices,
-                "directions": selected_directions,
-                "counterfactual_types": counterfactual_types,
-                "relations": relations,
-                "grid_sizes": grid_sizes,
-                "complexities": complexities,
-                "max_examples": max_examples,
-                "output_dir": output_dir,
-                "device_map": device_map,
-                "torch_dtype": torch_dtype,
-                "overwrite": overwrite,
-                "verbose": verbose,
-            },
-            "discovery": {
-                "pair_count": len(pairs),
-                "skipped_pairs": discovery_skips,
-            },
-            "artifacts": {
-                "manifest_path": str(manifest_path),
-                "runs_path": str(runs_path),
-                "summary_path": str(summary_path),
-            },
-            "run_counts": {
-                "total_runs": len(runs),
-                "success_primary_count": int(sum(record["success_primary"] for record in runs)),
-                "parse_failure_count": int(sum(record["parse_failure"] for record in runs)),
-                "error_count": int(sum(record["error"] is not None for record in runs)),
-            },
-        }
-
-        with manifest_path.open("w") as f:
-            json.dump(manifest, f, indent=2)
+        manifest = _build_manifest(
+            model_id=model_id,
+            counterfactual_metadata_root=counterfactual_metadata_root,
+            counterfactual_trajectories_dir=counterfactual_trajectories_dir,
+            original_trajectories_dir=original_trajectories_dir,
+            selected_patch_sites=selected_patch_sites,
+            layer_indices=layer_indices,
+            selected_directions=selected_directions,
+            counterfactual_types=counterfactual_types,
+            relations=relations,
+            grid_sizes=grid_sizes,
+            complexities=complexities,
+            max_examples=max_examples,
+            output_dir=output_dir,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            overwrite=overwrite,
+            verbose=verbose,
+            pairs=pairs,
+            discovery_skips=discovery_skips,
+            manifest_path=manifest_path,
+            runs_path=runs_path,
+            summary_path=summary_path,
+            runs=runs,
+            expected_total_runs=expected_total_runs,
+            resumed_run_count=len(existing_runs),
+        )
+        _write_manifest(manifest_path, manifest)
 
         if verbose:
             print(f"Manifest saved to {manifest_path}")

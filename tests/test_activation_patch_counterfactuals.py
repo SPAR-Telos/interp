@@ -355,3 +355,115 @@ def test_activation_patch_counterfactuals_smoke(monkeypatch, tmp_path: Path):
     assert (output_dir / "runs.jsonl").exists()
     assert (output_dir / "summary_by_group.csv").exists()
     assert manifest["run_counts"]["total_runs"] == 1
+
+
+def test_activation_patch_counterfactuals_resume_skips_completed(monkeypatch, tmp_path: Path):
+    data_root = tmp_path / "data"
+    original_root = data_root / "trajectories_test_full"
+    counterfactual_root = data_root / "counterfactual_trajectories"
+    metadata_root = data_root / "counterfactual_grids" / "size9"
+    original_root.mkdir(parents=True)
+    counterfactual_root.mkdir(parents=True)
+    metadata_root.mkdir(parents=True)
+
+    original_path = original_root / "original.json"
+    counterfactual_path = counterfactual_root / "cf.json"
+    original_path.write_text(json.dumps(_make_trajectory("DOWN")))
+    counterfactual_path.write_text(json.dumps(_make_trajectory("RIGHT")))
+
+    metadata_path = metadata_root / "counterfactuals.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "source_relative_path": str(original_path.relative_to(tmp_path)),
+                "source_step_id": 0,
+                "requested_instance_id": 0,
+                "actual_instance_id": 1,
+                "original_optimal_action_set_names": ["DOWN"],
+                "agent_moved_counterfactuals": [
+                    {
+                        "counterfactual_id": "agent_moved_00",
+                        "counterfactual_type": "agent_moved",
+                        "optimal_action_set_names": ["RIGHT"],
+                    }
+                ],
+            }
+        )
+    )
+    (counterfactual_root / "counterfactual_trajectory_batch_summary.json").write_text(
+        json.dumps(
+            {
+                "successes": [
+                    {
+                        "source_counterfactual_path": str(metadata_path),
+                        "output_path": str(counterfactual_path),
+                        "counterfactual_id": "agent_moved_00",
+                        "counterfactual_type": "agent_moved",
+                        "relation_to_original": "disjoint",
+                        "grid_size": 9,
+                        "grid_complexity": 0.0,
+                        "source_filename": "original.json",
+                    }
+                ]
+            }
+        )
+    )
+
+    class FakeConfig:
+        num_hidden_layers = 1
+
+    class FakeModel:
+        def __init__(self, *args, **kwargs):
+            self.config = FakeConfig()
+
+    def fail_capture(*args, **kwargs):
+        raise AssertionError("resume path should skip donor capture for completed runs")
+
+    def fail_generate(*args, **kwargs):
+        raise AssertionError("resume path should skip target generation for completed runs")
+
+    monkeypatch.setattr(
+        "telos_interp.commands.activation_patch_counterfactuals.activation_patch_counterfactuals_fn.StandardizedTransformer",
+        FakeModel,
+    )
+    monkeypatch.setattr(
+        "telos_interp.commands.activation_patch_counterfactuals.activation_patch_counterfactuals_fn._capture_donor_activations",
+        fail_capture,
+    )
+    monkeypatch.setattr(
+        "telos_interp.commands.activation_patch_counterfactuals.activation_patch_counterfactuals_fn._run_target_generation",
+        fail_generate,
+    )
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    existing_record = {
+        "run_key": "agent_moved_00|0|counterfactual_to_original|prompt_boundary|0",
+        "counterfactual_id": "agent_moved_00",
+        "step_idx": 0,
+        "direction": "counterfactual_to_original",
+        "patch_site": "prompt_boundary",
+        "layer": 0,
+        "success_primary": True,
+        "parse_failure": False,
+        "error": None,
+        "action_changed_vs_baseline": True,
+        "patched_in_source_optimal_set": True,
+        "patched_in_target_optimal_set": False,
+        "patched_in_expected_optimal_set": True,
+    }
+    (output_dir / "runs.jsonl").write_text(json.dumps(existing_record) + "\n")
+
+    manifest = activation_patch_counterfactuals(
+        counterfactual_metadata_root=str(data_root / "counterfactual_grids"),
+        counterfactual_trajectories_dir=str(counterfactual_root),
+        original_trajectories_dir=str(original_root),
+        patch_sites=PATCH_SITE_PROMPT_BOUNDARY,
+        layers="0",
+        directions="counterfactual_to_original",
+        output_dir=str(output_dir),
+        verbose=False,
+    )
+
+    assert manifest["progress"]["resumed_run_count"] == 1
+    assert manifest["run_counts"]["total_runs"] == 1
