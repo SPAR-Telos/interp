@@ -251,10 +251,19 @@ def _decode_generated_ids(model: StandardizedTransformer, generated_ids: torch.T
 
 def extract_action_from_text(text: str) -> str | None:
     """Parse the final JSON action from model text."""
-    match = re.search(r'"action"\s*:\s*"(?P<action>UP|DOWN|LEFT|RIGHT)"', text)
-    if match is None:
+    patterns = (
+        r'["\']action["\']\s*:\s*["\'](?P<action>up|down|left|right)["\']',
+        r"\baction\b\s*[:=]\s*[\"']?(?P<action>up|down|left|right)[\"']?",
+    )
+    matches: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            matches.append(match.group("action").upper())
+
+    if not matches:
         return None
-    return match.group("action")
+
+    return matches[-1]
 
 
 def _run_target_generation(
@@ -490,6 +499,8 @@ def _build_summary_dataframe(run_records: list[dict[str, Any]]) -> pd.DataFrame:
                 "grid_size",
                 "grid_complexity",
                 "runs",
+                "executed_runs",
+                "skipped_runs",
                 "successes_primary",
                 "success_rate_primary",
                 "action_changed_rate",
@@ -501,6 +512,7 @@ def _build_summary_dataframe(run_records: list[dict[str, Any]]) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(run_records)
+    df["skipped"] = df["skipped"].fillna(False)
     group_cols = [
         "direction",
         "layer",
@@ -511,10 +523,31 @@ def _build_summary_dataframe(run_records: list[dict[str, Any]]) -> pd.DataFrame:
         "grid_complexity",
     ]
 
-    summary = (
+    base_summary = (
         df.groupby(group_cols, dropna=False)
         .agg(
             runs=("counterfactual_id", "count"),
+            skipped_runs=("skipped", "sum"),
+        )
+        .reset_index()
+    )
+    base_summary["executed_runs"] = base_summary["runs"] - base_summary["skipped_runs"]
+
+    executed_df = df[df["skipped"] != True]  # noqa: E712
+    if executed_df.empty:
+        summary = base_summary.copy()
+        summary["successes_primary"] = 0
+        summary["success_rate_primary"] = None
+        summary["action_changed_rate"] = None
+        summary["patched_in_source_optimal_rate"] = None
+        summary["patched_in_target_optimal_rate"] = None
+        summary["patched_in_expected_optimal_rate"] = None
+        summary["parse_failure_rate"] = None
+        return summary
+
+    executed_summary = (
+        executed_df.groupby(group_cols, dropna=False)
+        .agg(
             successes_primary=("success_primary", "sum"),
             success_rate_primary=("success_primary", "mean"),
             action_changed_rate=("action_changed_vs_baseline", "mean"),
@@ -525,6 +558,9 @@ def _build_summary_dataframe(run_records: list[dict[str, Any]]) -> pd.DataFrame:
         )
         .reset_index()
     )
+
+    summary = base_summary.merge(executed_summary, on=group_cols, how="left")
+    summary["successes_primary"] = summary["successes_primary"].fillna(0).astype(int)
 
     return summary
 
@@ -648,6 +684,7 @@ def _build_manifest(
     output_dir: str,
     device_map: str,
     torch_dtype: str,
+    require_recorded_actions_in_optimal_set: bool,
     overwrite: bool,
     verbose: bool,
     pairs: list[PatchPair],
@@ -655,6 +692,7 @@ def _build_manifest(
     manifest_path: Path,
     runs_path: Path,
     summary_path: Path,
+    failures_path: Path,
     runs: list[dict[str, Any]],
     expected_total_runs: int,
     resumed_run_count: int,
@@ -678,6 +716,7 @@ def _build_manifest(
             "output_dir": output_dir,
             "device_map": device_map,
             "torch_dtype": torch_dtype,
+            "require_recorded_actions_in_optimal_set": require_recorded_actions_in_optimal_set,
             "overwrite": overwrite,
             "verbose": verbose,
         },
@@ -689,6 +728,7 @@ def _build_manifest(
             "manifest_path": str(manifest_path),
             "runs_path": str(runs_path),
             "summary_path": str(summary_path),
+            "parse_failures_path": str(failures_path),
         },
         "progress": {
             "expected_total_runs": expected_total_runs,
@@ -698,6 +738,7 @@ def _build_manifest(
         },
         "run_counts": {
             "total_runs": len(runs),
+            "skipped_count": int(sum(bool(record.get("skipped")) for record in runs)),
             "success_primary_count": int(sum(record["success_primary"] for record in runs)),
             "parse_failure_count": int(sum(record["parse_failure"] for record in runs)),
             "error_count": int(sum(record["error"] is not None for record in runs)),
@@ -726,6 +767,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
     output_dir: str = "data/activation_patching",
     device_map: str = "auto",
     torch_dtype: str = "auto",
+    require_recorded_actions_in_optimal_set: bool = True,
     overwrite: bool = False,
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -753,8 +795,9 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
     manifest_path = output_dir_path / "manifest.json"
     runs_path = output_dir_path / "runs.jsonl"
     summary_path = output_dir_path / "summary_by_group.csv"
+    failures_path = output_dir_path / "parse_failures.jsonl"
     if overwrite:
-        for path in (manifest_path, runs_path, summary_path):
+        for path in (manifest_path, runs_path, summary_path, failures_path):
             if path.exists():
                 path.unlink()
         existing_runs: list[dict[str, Any]] = []
@@ -762,7 +805,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
         existing_runs = _load_existing_runs(runs_path)
     else:
         existing_runs = []
-        if manifest_path.exists() or summary_path.exists():
+        if manifest_path.exists() or summary_path.exists() or failures_path.exists():
             raise FileExistsError(
                 f"Found partial outputs in {output_dir_path} without runs.jsonl. "
                 "Pass overwrite=True to replace them."
@@ -816,6 +859,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
             output_dir=output_dir,
             device_map=device_map,
             torch_dtype=torch_dtype,
+            require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
             overwrite=overwrite,
             verbose=verbose,
             pairs=pairs,
@@ -823,6 +867,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
             manifest_path=manifest_path,
             runs_path=runs_path,
             summary_path=summary_path,
+            failures_path=failures_path,
             runs=runs,
             expected_total_runs=expected_total_runs,
             resumed_run_count=len(existing_runs),
@@ -878,6 +923,110 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
 
                 source_recorded_action = _extract_recorded_action(source_trajectory, pair.source_step_id)
                 target_recorded_action = _extract_recorded_action(target_trajectory, pair.source_step_id)
+                source_recorded_action_in_optimal_set = (
+                    source_recorded_action in source_optimal_actions if source_recorded_action is not None else False
+                )
+                target_recorded_action_in_optimal_set = (
+                    target_recorded_action in target_optimal_actions if target_recorded_action is not None else False
+                )
+
+                if require_recorded_actions_in_optimal_set and (
+                    not source_recorded_action_in_optimal_set or not target_recorded_action_in_optimal_set
+                ):
+                    skip_reason = "recorded_action_not_in_optimal_set"
+                    for patch_site in selected_patch_sites:
+                        for layer in layer_indices:
+                            run_key = _make_run_key(pair, direction, patch_site, layer)
+                            if run_key in completed_run_keys:
+                                continue
+                            run_record = {
+                                "metadata_path": pair.metadata_path,
+                                "counterfactual_id": pair.counterfactual_id,
+                                "counterfactual_type": pair.counterfactual_type,
+                                "relation_to_original": pair.relation_to_original,
+                                "grid_size": pair.grid_size,
+                                "grid_complexity": pair.grid_complexity,
+                                "requested_instance_id": pair.requested_instance_id,
+                                "actual_instance_id": pair.actual_instance_id,
+                                "source_filename": pair.source_filename,
+                                "run_key": run_key,
+                                "direction": direction,
+                                "source_label": source_label,
+                                "target_label": target_label,
+                                "patch_site": patch_site,
+                                "layer": layer,
+                                "step_idx": pair.source_step_id,
+                                "source_trajectory_path": source_path,
+                                "target_trajectory_path": target_path,
+                                "source_recorded_action": source_recorded_action,
+                                "target_recorded_action": target_recorded_action,
+                                "source_recorded_action_in_optimal_set": source_recorded_action_in_optimal_set,
+                                "target_recorded_action_in_optimal_set": target_recorded_action_in_optimal_set,
+                                "baseline_target_action": None,
+                                "patched_target_action": None,
+                                "source_optimal_actions": list(source_optimal_actions),
+                                "target_optimal_actions": list(target_optimal_actions),
+                                "baseline_parse_failure": False,
+                                "parse_failure": False,
+                                "baseline_error": None,
+                                "donor_error": None,
+                                "patched_error": None,
+                                "error": None,
+                                "run_wall_time_seconds": 0.0,
+                                "baseline_generation_seconds": 0.0,
+                                "donor_capture_seconds": 0.0,
+                                "patched_generation_seconds": 0.0,
+                                "baseline_input_token_count": None,
+                                "patched_input_token_count": None,
+                                "baseline_generated_token_count": None,
+                                "patched_generated_token_count": None,
+                                "patched_boundary_positions": None,
+                                "donor_boundary_positions": None,
+                                "donor_input_token_count": None,
+                                "patched_in_source_optimal_set": None,
+                                "patched_in_target_optimal_set": None,
+                                "patched_in_expected_optimal_set": None,
+                                "action_changed_vs_baseline": None,
+                                "success_primary": False,
+                                "expected_source_dominance": direction in VALID_DIRECTIONS
+                                and pair.relation_to_original == "disjoint",
+                                "skipped": True,
+                                "skip_reason": skip_reason,
+                            }
+                            runs.append(run_record)
+                            completed_run_keys.add(run_key)
+                            _append_jsonl_record(runs_path, run_record)
+                            manifest = _build_manifest(
+                                model_id=model_id,
+                                counterfactual_metadata_root=counterfactual_metadata_root,
+                                counterfactual_trajectories_dir=counterfactual_trajectories_dir,
+                                original_trajectories_dir=original_trajectories_dir,
+                                selected_patch_sites=selected_patch_sites,
+                                layer_indices=layer_indices,
+                                selected_directions=selected_directions,
+                                counterfactual_types=counterfactual_types,
+                                relations=relations,
+                                grid_sizes=grid_sizes,
+                                complexities=complexities,
+                                max_examples=max_examples,
+                                output_dir=output_dir,
+                                device_map=device_map,
+                                torch_dtype=torch_dtype,
+                                require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
+                                overwrite=overwrite,
+                                verbose=verbose,
+                                pairs=pairs,
+                                discovery_skips=discovery_skips,
+                                manifest_path=manifest_path,
+                                runs_path=runs_path,
+                                summary_path=summary_path,
+                                failures_path=failures_path,
+                                runs=runs,
+                                expected_total_runs=expected_total_runs,
+                                resumed_run_count=len(existing_runs),
+                            )
+                            _write_manifest(manifest_path, manifest)
+                    continue
 
                 for patch_site in selected_patch_sites:
                     baseline_key = (target_path, patch_site, pair.source_step_id)
@@ -1015,6 +1164,8 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             "target_trajectory_path": target_path,
                             "source_recorded_action": source_recorded_action,
                             "target_recorded_action": target_recorded_action,
+                            "source_recorded_action_in_optimal_set": source_recorded_action_in_optimal_set,
+                            "target_recorded_action_in_optimal_set": target_recorded_action_in_optimal_set,
                             "baseline_target_action": baseline_result["action"],
                             "patched_target_action": patched_result["action"],
                             "source_optimal_actions": list(source_optimal_actions),
@@ -1036,11 +1187,37 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             "patched_boundary_positions": patched_result["absolute_positions"],
                             "donor_boundary_positions": donor_result["absolute_positions"],
                             "donor_input_token_count": donor_result["input_token_count"],
+                            "skipped": False,
+                            "skip_reason": None,
                             **outcome_flags,
                         }
                         runs.append(run_record)
                         completed_run_keys.add(run_key)
                         _append_jsonl_record(runs_path, run_record)
+                        if baseline_result["parse_failure"] or patched_result["parse_failure"]:
+                            _append_jsonl_record(
+                                failures_path,
+                                {
+                                    "run_key": run_key,
+                                    "counterfactual_id": pair.counterfactual_id,
+                                    "direction": direction,
+                                    "patch_site": patch_site,
+                                    "layer": layer,
+                                    "step_idx": pair.source_step_id,
+                                    "baseline_parse_failure": bool(baseline_result["parse_failure"]),
+                                    "parse_failure": bool(patched_result["parse_failure"]),
+                                    "baseline_error": baseline_result["error"],
+                                    "patched_error": patched_result["error"],
+                                    "baseline_output_text": (
+                                        baseline_result["output_text"]
+                                        if baseline_result["parse_failure"]
+                                        else None
+                                    ),
+                                    "patched_output_text": (
+                                        patched_result["output_text"] if patched_result["parse_failure"] else None
+                                    ),
+                                },
+                            )
                         if verbose and hasattr(pair_iterator, "set_postfix") and len(runs) % 5 == 0:
                             pair_iterator.set_postfix(_format_tqdm_postfix(runs, expected_total_runs))
                         manifest = _build_manifest(
@@ -1059,6 +1236,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             output_dir=output_dir,
                             device_map=device_map,
                             torch_dtype=torch_dtype,
+                            require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
                             overwrite=overwrite,
                             verbose=verbose,
                             pairs=pairs,
@@ -1066,6 +1244,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             manifest_path=manifest_path,
                             runs_path=runs_path,
                             summary_path=summary_path,
+                            failures_path=failures_path,
                             runs=runs,
                             expected_total_runs=expected_total_runs,
                             resumed_run_count=len(existing_runs),
@@ -1093,6 +1272,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
             output_dir=output_dir,
             device_map=device_map,
             torch_dtype=torch_dtype,
+            require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
             overwrite=overwrite,
             verbose=verbose,
             pairs=pairs,
@@ -1100,6 +1280,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
             manifest_path=manifest_path,
             runs_path=runs_path,
             summary_path=summary_path,
+            failures_path=failures_path,
             runs=runs,
             expected_total_runs=expected_total_runs,
             resumed_run_count=len(existing_runs),

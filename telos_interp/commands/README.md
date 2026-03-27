@@ -52,6 +52,9 @@ Artifacts written:
 - `manifest.json`
 - `runs.jsonl`
 - `summary_by_group.csv`
+- `parse_failures.jsonl`
+
+By default, runs are skipped early when the recorded source or target action is not in its own optimal action set. Disable this with `--require-recorded-actions-in-optimal-set false`.
 
 If `runs.jsonl` already exists in the output directory, the command resumes automatically and skips completed runs.
 
