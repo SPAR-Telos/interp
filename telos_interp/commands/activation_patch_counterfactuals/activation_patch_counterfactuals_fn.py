@@ -121,8 +121,7 @@ def resolve_prompt_boundary_token_ids(prompt_suffix_tokens: list[dict[str, Any]]
     """Resolve and validate the prompt-side assistant boundary tokens."""
     if len(prompt_suffix_tokens) != 3:
         raise ValueError(
-            "prompt_boundary requires exactly 3 prompt_suffix tokens, "
-            f"found {len(prompt_suffix_tokens)}."
+            f"prompt_boundary requires exactly 3 prompt_suffix tokens, found {len(prompt_suffix_tokens)}."
         )
 
     token_text = tuple(token["token"] for token in prompt_suffix_tokens)
@@ -134,10 +133,7 @@ def resolve_prompt_boundary_token_ids(prompt_suffix_tokens: list[dict[str, Any]]
 
     token_ids = [int(token["id"]) for token in prompt_suffix_tokens]
     if token_ids != [0, 1, 2]:
-        raise ValueError(
-            "prompt_boundary token ids must be [0, 1, 2]. "
-            f"Got {token_ids}."
-        )
+        raise ValueError(f"prompt_boundary token ids must be [0, 1, 2]. Got {token_ids}.")
 
     return token_ids
 
@@ -628,17 +624,27 @@ def activation_patch_counterfactuals(
                 target_trajectory = trajectory_by_label[target_label]
 
                 source_optimal_actions = (
-                    pair.original_optimal_actions if source_label == "original" else pair.counterfactual_optimal_actions
+                    pair.original_optimal_actions
+                    if source_label == "original"
+                    else pair.counterfactual_optimal_actions
                 )
                 target_optimal_actions = (
-                    pair.counterfactual_optimal_actions if target_label == "counterfactual" else pair.original_optimal_actions
+                    pair.counterfactual_optimal_actions
+                    if target_label == "counterfactual"
+                    else pair.original_optimal_actions
                 )
 
                 source_recorded_action = _extract_recorded_action(source_trajectory, pair.source_step_id)
                 target_recorded_action = _extract_recorded_action(target_trajectory, pair.source_step_id)
 
                 for patch_site in selected_patch_sites:
-                    baseline_key = (target_label == "original" and pair.original_trajectory_path or pair.counterfactual_trajectory_path, patch_site, pair.source_step_id)
+                    baseline_key = (
+                        target_label == "original"
+                        and pair.original_trajectory_path
+                        or pair.counterfactual_trajectory_path,
+                        patch_site,
+                        pair.source_step_id,
+                    )
                     if baseline_key not in baseline_cache:
                         baseline_cache[baseline_key] = _run_target_generation(
                             model=model,
@@ -651,7 +657,9 @@ def activation_patch_counterfactuals(
 
                     for layer in layer_indices:
                         donor_key = (
-                            source_label == "original" and pair.original_trajectory_path or pair.counterfactual_trajectory_path,
+                            source_label == "original"
+                            and pair.original_trajectory_path
+                            or pair.counterfactual_trajectory_path,
                             patch_site,
                             pair.source_step_id,
                             layer,
