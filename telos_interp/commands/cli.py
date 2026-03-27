@@ -4,6 +4,7 @@ import logging
 
 import tyro
 
+from telos_interp.commands.activation_patching import run_activation_patching
 from telos_interp.commands.apply_cognitive_map_probe import apply_cognitive_map_probe
 from telos_interp.commands.eval_cognitive_map_probe import eval_cognitive_map_probe
 from telos_interp.commands.eval_distance_probe import eval_distance_probe
@@ -24,6 +25,7 @@ def main():
     - train_cognitive_map_probe: Train cognitive map probing classifiers (LR or MLP)
     - apply_cognitive_map_probe: Apply trained probes to trajectories and store predictions
     - eval_cognitive_map_probe: Evaluate probes on test trajectories with detailed metrics
+    - run_activation_patching: Run experiments with activation patching
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     tyro.extras.subcommand_cli_from_dict(
@@ -35,6 +37,7 @@ def main():
             "train_cognitive_map_probe": train_cognitive_map_probe,
             "apply_cognitive_map_probe": apply_cognitive_map_probe,
             "eval_cognitive_map_probe": eval_cognitive_map_probe,
+            "run_activation_patching": run_activation_patching,
         }
     )
 
