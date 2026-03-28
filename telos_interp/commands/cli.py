@@ -11,6 +11,7 @@ from telos_interp.commands.gather_activations import gather_activations
 from telos_interp.commands.prepare_activations_for_probing import prepare_activations_for_probing
 from telos_interp.commands.train_cognitive_map_probe import train_cognitive_map_probe
 from telos_interp.commands.train_distance_probe import train_distance_probe
+from telos_interp.commands.train_key_collected_probe import train_key_collected_probe
 
 
 def main():
@@ -33,6 +34,7 @@ def main():
             "eval_distance_probe": eval_distance_probe,
             "prepare_activations_for_probing": prepare_activations_for_probing,
             "train_cognitive_map_probe": train_cognitive_map_probe,
+            "train_key_collected_probe": train_key_collected_probe,
             "apply_cognitive_map_probe": apply_cognitive_map_probe,
             "eval_cognitive_map_probe": eval_cognitive_map_probe,
         }

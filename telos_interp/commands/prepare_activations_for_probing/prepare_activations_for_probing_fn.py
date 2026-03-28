@@ -26,7 +26,7 @@ ACTION_TO_ID = {
 }
 
 # Probe type literal for type hints
-ProbeType = Literal["grid_tile", "distance", "action_sequence"]
+ProbeType = Literal["grid_tile", "distance", "action_sequence", "key_collected"]
 
 
 def _sample_triples(
@@ -250,6 +250,18 @@ def _process_single_folder(
                 continue
             vectors, labels = result
 
+        elif probe_type == "key_collected":
+            result = _process_key_collected_trajectory(
+                activation=activation,
+                trajectory_data=trajectory_data,
+                step_idx=grid_step_idx,
+                verbose=verbose,
+            )
+            if result is None:
+                skipped += 1
+                continue
+            vectors, labels = result
+
         else:
             raise ValueError(f"Unknown probe_type: {probe_type}")
 
@@ -397,6 +409,46 @@ def _process_action_sequence_trajectory(
     vectors = activation.unsqueeze(0)  # (1, activation_dim)
     labels = torch.tensor(action_ids, dtype=torch.int64)  # (seq_len,)
 
+    return vectors, labels
+
+
+def _process_key_collected_trajectory(
+    activation: torch.Tensor,
+    trajectory_data: dict,
+    step_idx: int,
+    verbose: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Process a trajectory for key_collected probe type.
+
+    Returns:
+        Tuple of (vectors, labels) where vectors is (1, activation_dim) and
+        labels is (1,) with value 0 (not collected) or 1 (collected),
+        or None if should be skipped.
+    """
+    try:
+        steps = trajectory_data.get("steps", [])
+        if not steps:
+            if verbose:
+                print("  Skipped: no steps found in trajectory")
+            return None
+        if step_idx >= len(steps):
+            if verbose:
+                print(f"  Skipped: step_idx {step_idx} >= num_steps {len(steps)}")
+            return None
+        key_collected = steps[step_idx].get("carrying_key")
+        if key_collected is None:
+            key_collected = steps[step_idx].get("key_collected")
+        if key_collected is None:
+            if verbose:
+                print(f"  Skipped: neither 'carrying_key' nor 'key_collected' found in step {step_idx}")
+            return None
+    except (KeyError, TypeError, IndexError) as e:
+        if verbose:
+            print(f"  Skipped: failed to get key_collected: {e}")
+        return None
+
+    vectors = activation.unsqueeze(0)  # (1, activation_dim)
+    labels = torch.tensor([int(key_collected)], dtype=torch.int64)  # (1,)
     return vectors, labels
 
 
