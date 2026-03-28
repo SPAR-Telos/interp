@@ -286,12 +286,23 @@ def _capture_donor_activations(
 
 
 def _resolve_action_token(output_tokens: list[dict[str, Any]]) -> tuple[int, dict[str, Any]]:
-    matches = [(idx, token) for idx, token in enumerate(output_tokens) if "action" in token.get("token_groups", [])]
-    if not matches:
+    final_matches = [
+        (idx, token)
+        for idx, token in enumerate(output_tokens)
+        if "action" in token.get("token_groups", []) and "final" in token.get("token_groups", [])
+    ]
+    if len(final_matches) == 1:
+        return final_matches[0]
+    if len(final_matches) > 1:
+        raise ValueError("Found multiple final action tokens in output_tokens.")
+
+    action_matches = [(idx, token) for idx, token in enumerate(output_tokens) if "action" in token.get("token_groups", [])]
+    if not action_matches:
         raise ValueError("Could not find an action token in output_tokens.")
-    if len(matches) > 1:
-        raise ValueError("Found multiple action tokens in output_tokens.")
-    return matches[0]
+    if len(action_matches) == 1:
+        return action_matches[0]
+
+    raise ValueError("Found multiple action tokens in output_tokens and could not isolate a final action token.")
 
 
 def _build_answer_forcing_input(

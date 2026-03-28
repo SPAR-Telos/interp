@@ -8,12 +8,16 @@ from pathlib import Path
 import pandas as pd
 import torch
 from telos_interp.commands.activation_patch_counterfactuals.activation_patch_counterfactuals_fn import (
+    PATCH_SITE_PRE_FINAL_BOUNDARY,
     PATCH_SITE_PROMPT_BOUNDARY,
+    _build_answer_forcing_input,
     _build_summary_dataframe,
+    _resolve_action_token,
     activation_patch_counterfactuals,
     compute_outcome_flags,
     discover_patch_pairs,
     extract_action_from_text,
+    resolve_modified_grid_cell_token_ids,
     resolve_pre_final_boundary_token_ids,
     resolve_prompt_boundary_token_ids,
 )
@@ -121,6 +125,41 @@ def test_resolve_pre_final_boundary_token_ids_ambiguous():
         assert "multiple candidate" in str(exc)
     else:
         raise AssertionError("Expected ValueError for ambiguous pre-final boundary")
+
+
+def test_resolve_modified_grid_cell_token_ids_valid():
+    grid_tokens = [
+        {"id": 0, "token": "h", "token_id": 1, "token_groups": ["grid_state"]},
+        {"id": 1, "token": "A", "token_id": 2, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 2, "token": "B", "token_id": 3, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 3, "token": "C", "token_id": 4, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 4, "token": "D", "token_id": 5, "token_groups": ["grid_state", "grid_tile"]},
+    ]
+    assert resolve_modified_grid_cell_token_ids(grid_tokens, 2, ((0, 0), (1, 1))) == [1, 4]
+
+
+def test_resolve_modified_grid_cell_token_ids_requires_one_token_per_cell():
+    grid_tokens = [
+        {"id": 0, "token": "A", "token_id": 2, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 1, "token": "B", "token_id": 3, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 2, "token": "space", "token_id": 4, "token_groups": ["grid_state"]},
+    ]
+    try:
+        resolve_modified_grid_cell_token_ids(grid_tokens, 2, ((0, 0), (1, 1)))
+    except ValueError as exc:
+        assert "exactly one grid_tile token per grid cell" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for non-cell-aligned grid tokens")
+
+
+def test_resolve_action_token_prefers_final_action_token():
+    output_tokens = [
+        {"id": 0, "token": "left", "token_id": 1, "token_groups": ["output", "analysis", "action"]},
+        {"id": 1, "token": "LEFT", "token_id": 2, "token_groups": ["output", "final", "action"]},
+    ]
+    idx, token = _resolve_action_token(output_tokens)
+    assert idx == 1
+    assert token["token"] == "LEFT"
 
 
 def test_extract_action_from_text():
@@ -247,6 +286,32 @@ def test_build_summary_dataframe():
     assert df.iloc[0]["success_rate_primary"] == 1.0
 
 
+def test_build_answer_forcing_input_uses_recorded_action_prefix():
+    class FakeTokenizer:
+        mapping = {'"UP"': 11, '"DOWN"': 12, '"LEFT"': 13, '"RIGHT"': 14}
+
+        def encode(self, text, add_special_tokens=False):
+            if text not in self.mapping:
+                raise AssertionError(f"Unexpected token text: {text}")
+            return [self.mapping[text]]
+
+    class FakeModel:
+        tokenizer = FakeTokenizer()
+
+    forced = _build_answer_forcing_input(
+        FakeModel(),
+        _make_trajectory("DOWN"),
+        step_idx=0,
+        patch_site=PATCH_SITE_PRE_FINAL_BOUNDARY,
+    )
+
+    assert forced["recorded_action_token_id"] == 49412
+    assert forced["recorded_action_token_text"] == '"DOWN"'
+    assert forced["action_token_ids"]["DOWN"] == 12
+    assert forced["absolute_positions"] == [10, 11, 12]
+    assert forced["input_ids"][-1] == 1976
+
+
 def test_activation_patch_counterfactuals_smoke(monkeypatch, tmp_path: Path):
     data_root = tmp_path / "data"
     original_root = data_root / "trajectories_test_full"
@@ -350,6 +415,7 @@ def test_activation_patch_counterfactuals_smoke(monkeypatch, tmp_path: Path):
         patch_sites=PATCH_SITE_PROMPT_BOUNDARY,
         layers="0",
         directions="counterfactual_to_original",
+        evaluation_mode="free_generation",
         output_dir=str(output_dir),
         verbose=False,
         overwrite=True,
@@ -467,6 +533,7 @@ def test_activation_patch_counterfactuals_resume_skips_completed(monkeypatch, tm
         patch_sites=PATCH_SITE_PROMPT_BOUNDARY,
         layers="0",
         directions="counterfactual_to_original",
+        evaluation_mode="free_generation",
         output_dir=str(output_dir),
         verbose=False,
     )
@@ -563,6 +630,7 @@ def test_activation_patch_counterfactuals_skips_non_optimal_recorded_actions_by_
         patch_sites=PATCH_SITE_PROMPT_BOUNDARY,
         layers="0",
         directions="counterfactual_to_original",
+        evaluation_mode="free_generation",
         output_dir=str(output_dir),
         verbose=False,
         overwrite=True,
