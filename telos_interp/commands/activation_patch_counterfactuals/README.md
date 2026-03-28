@@ -6,6 +6,9 @@ The command patches semantic boundary tokens rather than arbitrary token slices:
 
 - `prompt_boundary`: the `"<|end|>"`, `"<|start|>"`, `"assistant"` triplet in `prompt_suffix_tokens`
 - `pre_final_boundary`: the same triplet immediately before `"<|channel|>", "final", "<|message|>"` in `output_tokens`
+- `modified_grid_cells`: only the two moved grid cells from the counterfactual metadata (`from_position`, `to_position`)
+
+`modified_grid_cells` requires exactly one `grid_tile` token per grid cell in `grid_state_tokens`; otherwise the run will fail fast rather than guess a token mapping.
 
 Example:
 
@@ -15,6 +18,8 @@ interp-cli activation_patch_counterfactuals \
     --patch-sites prompt_boundary,pre_final_boundary \
     --output-dir data/activation_patching
 ```
+
+The default `--evaluation-mode answer_forcing` uses teacher forcing up to the action token and reads next-token probabilities over the action vocabulary. Use `--evaluation-mode free_generation` to recover the older full-generation behavior.
 
 Artifacts:
 

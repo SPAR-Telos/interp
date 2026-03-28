@@ -24,12 +24,14 @@ from telos_interp.commands.gather_activations.gather_activations_utils import (
 VALID_ACTIONS = ("UP", "DOWN", "LEFT", "RIGHT")
 PATCH_SITE_PROMPT_BOUNDARY = "prompt_boundary"
 PATCH_SITE_PRE_FINAL_BOUNDARY = "pre_final_boundary"
+PATCH_SITE_MODIFIED_GRID_CELLS = "modified_grid_cells"
 EXPECTED_BOUNDARY_TOKENS = ("<|end|>", "<|start|>", "assistant")
 EXPECTED_FINAL_PREFIX = ("<|channel|>", "final", "<|message|>")
-VALID_PATCH_SITES = (PATCH_SITE_PROMPT_BOUNDARY, PATCH_SITE_PRE_FINAL_BOUNDARY)
+VALID_PATCH_SITES = (PATCH_SITE_PROMPT_BOUNDARY, PATCH_SITE_PRE_FINAL_BOUNDARY, PATCH_SITE_MODIFIED_GRID_CELLS)
 VALID_DIRECTIONS = ("original_to_counterfactual", "counterfactual_to_original")
 VALID_RELATIONS = ("same", "disjoint", "overlap")
 VALID_COUNTERFACTUAL_TYPES = ("agent_moved", "goal_moved")
+VALID_EVALUATION_MODES = ("answer_forcing", "free_generation")
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,9 @@ class PatchPair:
     counterfactual_trajectory_path: str
     original_optimal_actions: tuple[str, ...]
     counterfactual_optimal_actions: tuple[str, ...]
+    moved_entity: str | None
+    from_position: tuple[int, int] | None
+    to_position: tuple[int, int] | None
     requested_instance_id: int | None
     actual_instance_id: int | None
 
@@ -75,6 +80,14 @@ def _normalize_action_set(actions: list[str] | None) -> tuple[str, ...]:
     if not actions:
         return ()
     return tuple(str(action).upper() for action in actions)
+
+
+def _normalize_position(position: list[int] | tuple[int, int] | None) -> tuple[int, int] | None:
+    if position is None:
+        return None
+    if len(position) != 2:
+        raise ValueError(f"Expected a 2D grid position, got {position}.")
+    return int(position[0]), int(position[1])
 
 
 def _parse_string_spec(spec: str, valid_values: tuple[str, ...], name: str) -> list[str]:
@@ -157,10 +170,40 @@ def resolve_pre_final_boundary_token_ids(output_tokens: list[dict[str, Any]]) ->
     return matches[0]
 
 
+def resolve_modified_grid_cell_token_ids(
+    grid_state_tokens: list[dict[str, Any]],
+    grid_size: int,
+    modified_positions: tuple[tuple[int, int], ...],
+) -> list[int]:
+    """Resolve the grid_tile token ids for the modified source/destination cells."""
+    grid_tile_ids = [int(token["id"]) for token in grid_state_tokens if "grid_tile" in token.get("token_groups", [])]
+    expected_tile_count = grid_size * grid_size
+    if len(grid_tile_ids) != expected_tile_count:
+        raise ValueError(
+            "modified_grid_cells requires exactly one grid_tile token per grid cell. "
+            f"Expected {expected_tile_count}, found {len(grid_tile_ids)}."
+        )
+
+    resolved_ids: list[int] = []
+    for x, y in modified_positions:
+        if x < 0 or x >= grid_size or y < 0 or y >= grid_size:
+            raise ValueError(f"Modified grid position {(x, y)} is out of bounds for grid_size={grid_size}.")
+        resolved_ids.append(grid_tile_ids[(y * grid_size) + x])
+
+    unique_ids = sorted(set(resolved_ids))
+    if len(unique_ids) != len(resolved_ids):
+        raise ValueError(f"modified_grid_cells resolved duplicate token ids from positions {modified_positions}.")
+
+    return unique_ids
+
+
 def _build_input_ids_for_patch_site(
     trajectory: dict[str, Any],
     step_idx: int,
     patch_site: str,
+    grid_size: int | None = None,
+    modified_positions: tuple[tuple[int, int], ...] | None = None,
+    target_mode: str = "capture",
 ) -> tuple[list[int], list[int], int]:
     """Build input ids up to the selected site and return absolute patch positions."""
     step = trajectory["steps"][step_idx]
@@ -190,6 +233,23 @@ def _build_input_ids_for_patch_site(
         remaining_tokens = len(output_ids) - (end_idx + 1)
         return input_ids, absolute_positions, remaining_tokens
 
+    if patch_site == PATCH_SITE_MODIFIED_GRID_CELLS:
+        if grid_size is None or modified_positions is None:
+            raise ValueError("modified_grid_cells requires grid_size and modified_positions.")
+        relative_positions = resolve_modified_grid_cell_token_ids(
+            step["grid_state_tokens"], grid_size, modified_positions
+        )
+        absolute_positions = [len(prefix_ids) + position for position in relative_positions]
+        if target_mode == "capture":
+            end_idx = max(relative_positions)
+            input_ids = prefix_ids + grid_ids[: end_idx + 1]
+        elif target_mode == "free_generation":
+            input_ids = prefix_ids + grid_ids + suffix_ids
+        else:
+            raise ValueError(f"Unsupported target_mode for modified_grid_cells: {target_mode}")
+        remaining_tokens = len(output_ids)
+        return input_ids, absolute_positions, remaining_tokens
+
     raise ValueError(f"Unsupported patch_site: {patch_site}")
 
 
@@ -199,9 +259,18 @@ def _capture_donor_activations(
     step_idx: int,
     patch_site: str,
     layer: int,
+    grid_size: int | None = None,
+    modified_positions: tuple[tuple[int, int], ...] | None = None,
 ) -> dict[str, Any]:
     """Capture donor activations at the selected boundary tokens."""
-    input_ids_list, absolute_positions, _ = _build_input_ids_for_patch_site(trajectory, step_idx, patch_site)
+    input_ids_list, absolute_positions, _ = _build_input_ids_for_patch_site(
+        trajectory,
+        step_idx,
+        patch_site,
+        grid_size=grid_size,
+        modified_positions=modified_positions,
+        target_mode="capture",
+    )
     input_ids = torch.tensor([input_ids_list], dtype=torch.long)
 
     with torch.no_grad():
@@ -213,6 +282,79 @@ def _capture_donor_activations(
         "activations": donor_activations,
         "absolute_positions": absolute_positions,
         "input_token_count": len(input_ids_list),
+    }
+
+
+def _resolve_action_token(output_tokens: list[dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+    matches = [(idx, token) for idx, token in enumerate(output_tokens) if "action" in token.get("token_groups", [])]
+    if not matches:
+        raise ValueError("Could not find an action token in output_tokens.")
+    if len(matches) > 1:
+        raise ValueError("Found multiple action tokens in output_tokens.")
+    return matches[0]
+
+
+def _build_answer_forcing_input(
+    model: StandardizedTransformer,
+    trajectory: dict[str, Any],
+    step_idx: int,
+    patch_site: str,
+    grid_size: int | None = None,
+    modified_positions: tuple[tuple[int, int], ...] | None = None,
+) -> dict[str, Any]:
+    step = trajectory["steps"][step_idx]
+
+    prefix_ids = [token["token_id"] for token in trajectory["prompt"]["prompt_prefix_tokens"]]
+    grid_ids = [token["token_id"] for token in step["grid_state_tokens"]]
+    suffix_tokens = trajectory["prompt"]["prompt_suffix_tokens"]
+    suffix_ids = [token["token_id"] for token in suffix_tokens]
+    output_tokens = step["output_tokens"]
+    output_ids = [token["token_id"] for token in output_tokens]
+
+    prompt_offset = len(prefix_ids) + len(grid_ids)
+    output_offset = prompt_offset + len(suffix_ids)
+    action_output_idx, action_token = _resolve_action_token(output_tokens)
+
+    if patch_site == PATCH_SITE_PROMPT_BOUNDARY:
+        relative_positions = resolve_prompt_boundary_token_ids(suffix_tokens)
+        absolute_positions = [prompt_offset + position for position in relative_positions]
+    elif patch_site == PATCH_SITE_PRE_FINAL_BOUNDARY:
+        relative_positions = resolve_pre_final_boundary_token_ids(output_tokens)
+        absolute_positions = [output_offset + position for position in relative_positions]
+    elif patch_site == PATCH_SITE_MODIFIED_GRID_CELLS:
+        if grid_size is None or modified_positions is None:
+            raise ValueError("modified_grid_cells requires grid_size and modified_positions.")
+        relative_positions = resolve_modified_grid_cell_token_ids(
+            step["grid_state_tokens"], grid_size, modified_positions
+        )
+        absolute_positions = [prompt_offset + position for position in relative_positions]
+    else:
+        raise ValueError(f"Unsupported patch_site: {patch_site}")
+
+    input_ids = prefix_ids + grid_ids + suffix_ids + output_ids[:action_output_idx]
+
+    action_token_text = str(action_token["token"])
+    candidate_texts = (
+        {action: f'"{action}"' for action in VALID_ACTIONS}
+        if action_token_text.startswith('"') and action_token_text.endswith('"')
+        else {action: action for action in VALID_ACTIONS}
+    )
+
+    action_token_ids: dict[str, int] = {}
+    for action, token_text in candidate_texts.items():
+        token_ids = model.tokenizer.encode(token_text, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f"Answer-forcing requires a single token for action {action!r}; got token ids {token_ids}."
+            )
+        action_token_ids[action] = int(token_ids[0])
+
+    return {
+        "input_ids": input_ids,
+        "absolute_positions": absolute_positions,
+        "action_token_ids": action_token_ids,
+        "recorded_action_token_id": int(action_token["token_id"]),
+        "recorded_action_token_text": action_token_text,
     }
 
 
@@ -273,10 +415,17 @@ def _run_target_generation(
     patch_site: str,
     layer: int | None = None,
     donor_activations: torch.Tensor | None = None,
+    grid_size: int | None = None,
+    modified_positions: tuple[tuple[int, int], ...] | None = None,
 ) -> dict[str, Any]:
     """Run baseline or patched generation for a target trajectory."""
     input_ids_list, absolute_positions, remaining_tokens = _build_input_ids_for_patch_site(
-        trajectory, step_idx, patch_site
+        trajectory,
+        step_idx,
+        patch_site,
+        grid_size=grid_size,
+        modified_positions=modified_positions,
+        target_mode="free_generation",
     )
     max_new_tokens = max(remaining_tokens + 16, 16)
     input_ids = torch.tensor([input_ids_list], dtype=torch.long)
@@ -301,6 +450,94 @@ def _run_target_generation(
         "generated_token_count": generated_length,
         "absolute_positions": absolute_positions,
     }
+
+
+def _run_target_answer_forcing(
+    model: StandardizedTransformer,
+    trajectory: dict[str, Any],
+    step_idx: int,
+    patch_site: str,
+    layer: int | None = None,
+    donor_activations: torch.Tensor | None = None,
+    grid_size: int | None = None,
+    modified_positions: tuple[tuple[int, int], ...] | None = None,
+) -> dict[str, Any]:
+    forced_input = _build_answer_forcing_input(
+        model,
+        trajectory,
+        step_idx,
+        patch_site,
+        grid_size=grid_size,
+        modified_positions=modified_positions,
+    )
+    input_ids_list = forced_input["input_ids"]
+    absolute_positions = forced_input["absolute_positions"]
+    input_ids = torch.tensor([input_ids_list], dtype=torch.long)
+
+    with torch.no_grad():
+        with model.trace(input_ids):
+            if donor_activations is not None:
+                if layer is None:
+                    raise ValueError("layer must be provided when donor_activations are supplied.")
+                device = model.layers_output[layer].device
+                model.layers_output[layer][0, absolute_positions, :] = donor_activations.to(device)
+            next_token_logits = model.logits[0, -1, :].save()
+
+    logits = next_token_logits.detach().cpu()
+    probabilities = torch.softmax(logits, dim=-1)
+    action_probabilities = {
+        action: float(probabilities[token_id].item()) for action, token_id in forced_input["action_token_ids"].items()
+    }
+    predicted_action = max(action_probabilities, key=action_probabilities.get)
+
+    return {
+        "output_text": None,
+        "action": predicted_action,
+        "parse_failure": False,
+        "input_token_count": len(input_ids_list),
+        "generated_token_count": 0,
+        "absolute_positions": absolute_positions,
+        "action_probabilities": action_probabilities,
+        "action_token_ids": forced_input["action_token_ids"],
+        "recorded_action_token_id": forced_input["recorded_action_token_id"],
+        "recorded_action_token_text": forced_input["recorded_action_token_text"],
+    }
+
+
+def _run_target_evaluation(
+    model: StandardizedTransformer,
+    trajectory: dict[str, Any],
+    step_idx: int,
+    patch_site: str,
+    evaluation_mode: str,
+    layer: int | None = None,
+    donor_activations: torch.Tensor | None = None,
+    grid_size: int | None = None,
+    modified_positions: tuple[tuple[int, int], ...] | None = None,
+) -> dict[str, Any]:
+    if evaluation_mode == "answer_forcing":
+        return _run_target_answer_forcing(
+            model=model,
+            trajectory=trajectory,
+            step_idx=step_idx,
+            patch_site=patch_site,
+            layer=layer,
+            donor_activations=donor_activations,
+            grid_size=grid_size,
+            modified_positions=modified_positions,
+        )
+    if evaluation_mode == "free_generation":
+        return _run_target_generation(
+            model=model,
+            trajectory=trajectory,
+            step_idx=step_idx,
+            patch_site=patch_site,
+            layer=layer,
+            donor_activations=donor_activations,
+            grid_size=grid_size,
+            modified_positions=modified_positions,
+        )
+    raise ValueError(f"Unsupported evaluation_mode: {evaluation_mode}")
 
 
 def _extract_recorded_action(trajectory: dict[str, Any], step_idx: int) -> str | None:
@@ -468,6 +705,9 @@ def discover_patch_pairs(
             counterfactual_trajectory_path=str(counterfactual_path),
             original_optimal_actions=_normalize_action_set(metadata.get("original_optimal_action_set_names")),
             counterfactual_optimal_actions=_normalize_action_set(entry.get("optimal_action_set_names")),
+            moved_entity=entry.get("moved_entity"),
+            from_position=_normalize_position(entry.get("from_position")),
+            to_position=_normalize_position(entry.get("to_position")),
             requested_instance_id=metadata.get("requested_instance_id"),
             actual_instance_id=metadata.get("actual_instance_id"),
         )
@@ -667,6 +907,14 @@ def _failed_generation_result(
     }
 
 
+def _get_modified_positions_for_pair(pair: PatchPair, patch_site: str) -> tuple[tuple[int, int], ...] | None:
+    if patch_site != PATCH_SITE_MODIFIED_GRID_CELLS:
+        return None
+    if pair.from_position is None or pair.to_position is None:
+        raise ValueError(f"modified_grid_cells requires from/to positions in metadata for {pair.counterfactual_id}.")
+    return (pair.from_position, pair.to_position)
+
+
 def _build_manifest(
     *,
     model_id: str,
@@ -684,6 +932,7 @@ def _build_manifest(
     output_dir: str,
     device_map: str,
     torch_dtype: str,
+    evaluation_mode: str,
     require_recorded_actions_in_optimal_set: bool,
     overwrite: bool,
     verbose: bool,
@@ -716,6 +965,7 @@ def _build_manifest(
             "output_dir": output_dir,
             "device_map": device_map,
             "torch_dtype": torch_dtype,
+            "evaluation_mode": evaluation_mode,
             "require_recorded_actions_in_optimal_set": require_recorded_actions_in_optimal_set,
             "overwrite": overwrite,
             "verbose": verbose,
@@ -767,6 +1017,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
     output_dir: str = "data/activation_patching",
     device_map: str = "auto",
     torch_dtype: str = "auto",
+    evaluation_mode: str = "answer_forcing",
     require_recorded_actions_in_optimal_set: bool = True,
     overwrite: bool = False,
     verbose: bool = True,
@@ -774,6 +1025,10 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
     """Run online activation patching between originals and counterfactuals."""
     selected_patch_sites = _parse_string_spec(patch_sites, VALID_PATCH_SITES, "patch_site")
     selected_directions = _parse_string_spec(directions, VALID_DIRECTIONS, "direction")
+    if evaluation_mode not in VALID_EVALUATION_MODES:
+        raise ValueError(
+            f"Invalid evaluation_mode: {evaluation_mode}. Expected one of {sorted(VALID_EVALUATION_MODES)}."
+        )
 
     pairs, discovery_skips = discover_patch_pairs(
         counterfactual_metadata_root=counterfactual_metadata_root,
@@ -807,8 +1062,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
         existing_runs = []
         if manifest_path.exists() or summary_path.exists() or failures_path.exists():
             raise FileExistsError(
-                f"Found partial outputs in {output_dir_path} without runs.jsonl. "
-                "Pass overwrite=True to replace them."
+                f"Found partial outputs in {output_dir_path} without runs.jsonl. Pass overwrite=True to replace them."
             )
 
     first_original = _load_json(Path(pairs[0].original_trajectory_path))
@@ -859,6 +1113,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
             output_dir=output_dir,
             device_map=device_map,
             torch_dtype=torch_dtype,
+            evaluation_mode=evaluation_mode,
             require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
             overwrite=overwrite,
             verbose=verbose,
@@ -902,7 +1157,9 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                 source_trajectory = trajectory_by_label[source_label]
                 target_trajectory = trajectory_by_label[target_label]
                 source_path = (
-                    pair.original_trajectory_path if source_label == "original" else pair.counterfactual_trajectory_path
+                    pair.original_trajectory_path
+                    if source_label == "original"
+                    else pair.counterfactual_trajectory_path
                 )
                 target_path = (
                     pair.counterfactual_trajectory_path
@@ -1012,6 +1269,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                                 output_dir=output_dir,
                                 device_map=device_map,
                                 torch_dtype=torch_dtype,
+                                evaluation_mode=evaluation_mode,
                                 require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
                                 overwrite=overwrite,
                                 verbose=verbose,
@@ -1029,16 +1287,20 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                     continue
 
                 for patch_site in selected_patch_sites:
+                    modified_positions = _get_modified_positions_for_pair(pair, patch_site)
                     baseline_key = (target_path, patch_site, pair.source_step_id)
                     baseline_cache_missed = baseline_key not in baseline_cache
                     if baseline_key not in baseline_cache:
                         try:
                             baseline_started_at = perf_counter()
-                            baseline_cache[baseline_key] = _run_target_generation(
+                            baseline_cache[baseline_key] = _run_target_evaluation(
                                 model=model,
                                 trajectory=target_trajectory,
                                 step_idx=pair.source_step_id,
                                 patch_site=patch_site,
+                                evaluation_mode=evaluation_mode,
+                                grid_size=pair.grid_size,
+                                modified_positions=modified_positions,
                             ) | {
                                 "error": None,
                                 "baseline_generation_seconds": perf_counter() - baseline_started_at,
@@ -1088,6 +1350,8 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                                         step_idx=pair.source_step_id,
                                         patch_site=patch_site,
                                         layer=layer,
+                                        grid_size=pair.grid_size,
+                                        modified_positions=modified_positions,
                                     ) | {
                                         "error": None,
                                         "donor_capture_seconds": perf_counter() - donor_started_at,
@@ -1113,13 +1377,16 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             else:
                                 try:
                                     patched_started_at = perf_counter()
-                                    patched_result = _run_target_generation(
+                                    patched_result = _run_target_evaluation(
                                         model=model,
                                         trajectory=target_trajectory,
                                         step_idx=pair.source_step_id,
                                         patch_site=patch_site,
+                                        evaluation_mode=evaluation_mode,
                                         layer=layer,
                                         donor_activations=donor_result["activations"],
+                                        grid_size=pair.grid_size,
+                                        modified_positions=modified_positions,
                                     ) | {
                                         "error": None,
                                         "patched_generation_seconds": perf_counter() - patched_started_at,
@@ -1168,6 +1435,18 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             "target_recorded_action_in_optimal_set": target_recorded_action_in_optimal_set,
                             "baseline_target_action": baseline_result["action"],
                             "patched_target_action": patched_result["action"],
+                            "baseline_action_probabilities": baseline_result.get("action_probabilities"),
+                            "patched_action_probabilities": patched_result.get("action_probabilities"),
+                            "action_token_ids": baseline_result.get("action_token_ids")
+                            or patched_result.get("action_token_ids"),
+                            "recorded_action_token_id": (
+                                baseline_result.get("recorded_action_token_id")
+                                or patched_result.get("recorded_action_token_id")
+                            ),
+                            "recorded_action_token_text": (
+                                baseline_result.get("recorded_action_token_text")
+                                or patched_result.get("recorded_action_token_text")
+                            ),
                             "source_optimal_actions": list(source_optimal_actions),
                             "target_optimal_actions": list(target_optimal_actions),
                             "baseline_parse_failure": bool(baseline_result["parse_failure"]),
@@ -1209,9 +1488,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                                     "baseline_error": baseline_result["error"],
                                     "patched_error": patched_result["error"],
                                     "baseline_output_text": (
-                                        baseline_result["output_text"]
-                                        if baseline_result["parse_failure"]
-                                        else None
+                                        baseline_result["output_text"] if baseline_result["parse_failure"] else None
                                     ),
                                     "patched_output_text": (
                                         patched_result["output_text"] if patched_result["parse_failure"] else None
@@ -1236,6 +1513,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
                             output_dir=output_dir,
                             device_map=device_map,
                             torch_dtype=torch_dtype,
+                            evaluation_mode=evaluation_mode,
                             require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
                             overwrite=overwrite,
                             verbose=verbose,
@@ -1272,6 +1550,7 @@ def activation_patch_counterfactuals(  # noqa: PLR0912
             output_dir=output_dir,
             device_map=device_map,
             torch_dtype=torch_dtype,
+            evaluation_mode=evaluation_mode,
             require_recorded_actions_in_optimal_set=require_recorded_actions_in_optimal_set,
             overwrite=overwrite,
             verbose=verbose,

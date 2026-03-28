@@ -38,13 +38,15 @@ interp-cli activation_patch_counterfactuals \
     --output-dir data/activation_patching
 ```
 
+Default evaluation is `answer_forcing`, which teacher-forces the output prefix up to the action token and reads the next-token action probabilities. Use `--evaluation-mode free_generation` for the older full-generation path.
+
 **Key options:**
 | Option | Description |
 |--------|-------------|
 | `--counterfactual-metadata-root` | Root directory with counterfactual grid metadata |
 | `--counterfactual-trajectories-dir` | Directory with generated counterfactual trajectories |
 | `--original-trajectories-dir` | Directory with original trajectories |
-| `--patch-sites` | Boundary sites to patch (`prompt_boundary`, `pre_final_boundary`) |
+| `--patch-sites` | Patch sites to patch (`prompt_boundary`, `pre_final_boundary`, `modified_grid_cells`) |
 | `--layers` | Layer indices to evaluate |
 | `--output-dir` | Directory for manifest and statistics outputs |
 
