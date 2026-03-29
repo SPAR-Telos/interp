@@ -338,7 +338,7 @@ def _build_answer_forcing_input(
         relative_positions = resolve_modified_grid_cell_token_ids(
             step["grid_state_tokens"], grid_size, modified_positions
         )
-        absolute_positions = [prompt_offset + position for position in relative_positions]
+        absolute_positions = [len(prefix_ids) + position for position in relative_positions]
     else:
         raise ValueError(f"Unsupported patch_site: {patch_site}")
 

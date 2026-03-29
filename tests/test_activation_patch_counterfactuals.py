@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from telos_interp.commands.activation_patch_counterfactuals.activation_patch_counterfactuals_fn import (
+    PATCH_SITE_MODIFIED_GRID_CELLS,
     PATCH_SITE_PRE_FINAL_BOUNDARY,
     PATCH_SITE_PROMPT_BOUNDARY,
     _build_answer_forcing_input,
@@ -310,6 +311,38 @@ def test_build_answer_forcing_input_uses_recorded_action_prefix():
     assert forced["action_token_ids"]["DOWN"] == 12
     assert forced["absolute_positions"] == [10, 11, 12]
     assert forced["input_ids"][-1] == 1976
+
+
+def test_build_answer_forcing_input_modified_grid_cells_uses_grid_offset():
+    class FakeTokenizer:
+        mapping = {'"UP"': 11, '"DOWN"': 12, '"LEFT"': 13, '"RIGHT"': 14}
+
+        def encode(self, text, add_special_tokens=False):
+            return [self.mapping[text]]
+
+    class FakeModel:
+        tokenizer = FakeTokenizer()
+
+    trajectory = _make_trajectory("DOWN")
+    trajectory["model_params"]["model_id"] = "dummy/model"
+    trajectory["steps"][0]["grid_state_tokens"] = [
+        {"id": 0, "token": "header", "token_id": 30, "token_groups": ["grid_state"]},
+        {"id": 1, "token": "A", "token_id": 31, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 2, "token": "B", "token_id": 32, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 3, "token": "C", "token_id": 33, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 4, "token": "D", "token_id": 34, "token_groups": ["grid_state", "grid_tile"]},
+    ]
+
+    forced = _build_answer_forcing_input(
+        FakeModel(),
+        trajectory,
+        step_idx=0,
+        patch_site=PATCH_SITE_MODIFIED_GRID_CELLS,
+        grid_size=2,
+        modified_positions=((0, 0), (1, 1)),
+    )
+
+    assert forced["absolute_positions"] == [3, 6]
 
 
 def test_activation_patch_counterfactuals_smoke(monkeypatch, tmp_path: Path):
