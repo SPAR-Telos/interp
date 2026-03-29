@@ -5268,15 +5268,12 @@ dependencies = [
     { name = "nnsight" },
     { name = "nnterp" },
     { name = "pandas" },
-    { name = "pytest" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "toml" },
     { name = "torch" },
     { name = "transformers" },
-    { name = "triton" },
     { name = "tyro" },
-    { name = "vllm" },
 ]
 
 [package.optional-dependencies]
@@ -5294,6 +5291,10 @@ notebook = [
     { name = "ipykernel" },
     { name = "ipywidgets" },
 ]
+vllm = [
+    { name = "triton" },
+    { name = "vllm" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -5305,7 +5306,6 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "pandas", marker = "extra == 'data'", specifier = ">=1.5.3" },
     { name = "pre-commit", marker = "extra == 'lint'", specifier = ">=4.2.0" },
-    { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest", marker = "extra == 'lint'", specifier = ">=8.3.5" },
     { name = "pytest-xdist", marker = "extra == 'lint'", specifier = ">=3.6.1" },
     { name = "ruff", marker = "extra == 'lint'", specifier = ">=0.11.0" },
@@ -5313,11 +5313,11 @@ requires-dist = [
     { name = "toml", specifier = ">=0.10.2" },
     { name = "torch", specifier = ">=2.0.1" },
     { name = "transformers", specifier = ">=4.42.0" },
-    { name = "triton", specifier = ">=3.5.0" },
+    { name = "triton", marker = "extra == 'vllm'", specifier = ">=3.5.0" },
     { name = "tyro", specifier = ">=1.0.5" },
-    { name = "vllm", specifier = ">=0.10.2" },
+    { name = "vllm", marker = "extra == 'vllm'", specifier = ">=0.10.2" },
 ]
-provides-extras = ["data", "lint", "notebook"]
+provides-extras = ["vllm", "data", "lint", "notebook"]
 
 [[package]]
 name = "threadpoolctl"

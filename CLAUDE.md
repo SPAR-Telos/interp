@@ -22,7 +22,7 @@ Requires Python 3.10+ (3.12 recommended). Use `uv` (not pip) for dependency mana
 ## Commands
 
 ```bash
-make test           # run pytest -n auto -vv
+make test           # run pytest -vv (uses .venv/bin/python directly)
 make check-style    # ruff format + lint check (no fixing)
 make fix-style      # ruff format + lint with auto-fix
 make clean          # remove __pycache__, build artifacts
@@ -40,12 +40,20 @@ uv run pytest -m "not slow and not require_cuda_gpu"
 
 ## CLI
 
-The package installs as `interp-cli` (entrypoint: `telos_interp.commands.cli:main`, built with Tyro):
+The package installs as `interp-cli` (entrypoint: `telos_interp.commands.cli:main`, built with Tyro). Requires `uv run` prefix when not installed globally:
 
 ```bash
-interp-cli --help
-interp-cli gather-activations --help
+uv run interp-cli --help
+uv run interp-cli gather_activations --help   # underscore in subcommand name
 ```
+
+Tyro generates CLI args from dataclass type hints automatically — subcommands are registered via `tyro.extras.subcommand_cli_from_dict()` in `cli.py`.
+
+**Index specification syntax** (used by `--layers`, `--steps`, token index args):
+- `"all"` — all available indices
+- `"0,1,5"` — explicit list (silently filtered to available indices)
+- `"0:10"` — inclusive range
+- `"-1"` — last index; `"-3:-1"` — last 3 indices
 
 ## Code Style
 
@@ -53,6 +61,7 @@ interp-cli gather-activations --help
 - Python 3.10+ syntax
 - Google-style docstrings
 - Ruff for formatting and linting (config in `pyproject.toml`)
+- Pre-commit hooks enforce: trailing whitespace, LF line endings, 2500KB file size limit, ruff format + lint
 
 ## Architecture
 
@@ -84,17 +93,18 @@ Annotated JSONs + metrics
   - `grid_utils.py` — grid state parsing and cell identity mappings
   - `probe_models.py` — probe model architectures
   - `training.py` — shared training utilities (train_epoch, normalization, device/seed setup)
-- `configs/` — TOML config templates for probe training runs
+- `configs/` — bash script templates (`.conf`) for probe training runs
 - `evaluation_scripts/` — standalone scripts for computing metrics
 - `plotting_scripts/` — visualization of probe evaluation results
 - `spaces/` — HuggingFace trace-viewer (git submodule)
 
-### Dependencies
+### Non-obvious Conventions
 
-- `nnsight` — activation extraction from transformer internals
-- `nnterp` — higher-level interpretability utilities
-- `tyro` — CLI framework (dataclass-based argument parsing)
-- `transformers` + `torch` — model loading and inference
+- **Activation folder hierarchy** encodes `model/layer/step/category/token_idx`; model folders identified by `"__"` in name (e.g., `openai__gpt-oss-20b`)
+- **Category ordering** for activation concatenation is fixed: `["prompt_prefix", "prompt_suffix", "grid_state", "output"]`
+- **Configs in `configs/`** are bash scripts (`.conf`), not TOML — they contain parameterized CLI invocation loops
+- **Normalization** uses per-feature z-score with std clamped to `≥1e-8` to handle constant features; params computed on training data only and saved with probe checkpoints
+- **Regression probes** output shape `(N,)` not `(N, 1)` due to `.squeeze(-1)` convention
 
 ## IRL & Behavioral Analysis Scripts (root-level)
 
@@ -155,10 +165,6 @@ Train `KeyCollectedProbe` classifiers for `carrying_key` and `door_open` from ac
 - **Pre vs post reasoning**: Pre-reasoning = last token of prompt suffix (before model output). Post-reasoning = last output token (after model commits to action). Post-reasoning activations are generally more informative for action prediction.
 - **Probe features for unvisited states**: In n-step IRL, the backward/forward passes need phi(s) for all states. States not visited in any demonstration fall back to binary has_key/door_open as proxy for p_key/p_door.
 
-## CLI Note
+## Dependency Management
 
-The CLI entrypoint requires `uv run` prefix when not installed globally:
-
-```bash
-uv run interp-cli gather_activations --help   # underscore in subcommand name
-```
+Use `uv` (not pip). To update dependencies: edit `pyproject.toml`, run `uv lock --upgrade` (or `uv lock --upgrade-package <name>`), then `uv sync`. Commit both `pyproject.toml` and `uv.lock`.

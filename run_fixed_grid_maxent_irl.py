@@ -19,10 +19,11 @@ Requires all 100 trajectories on the same fixed grid.
 
 Usage:
     # Step 0: gather activations (requires GPU + model access)
-    interp-cli gather-activations \\
-        --trajectory-paths "data/trajectories/fixed_key_door_grid/together_ai_openai_gpt-oss-20b_rooms2_doorkey_grid0_traj*.json" \\
-        --output-dir data/activations/activations_fixed_key_door_grid \\
-        --layers all --steps all --prompt-suffix-indices -1 --output-indices -1
+    interp-cli gather_activations \\
+        --trajectory-paths "data/trajectories/together_ai_openai_gpt-oss-20b_rooms3_doorkey_grid0_traj*.json" \\
+        --output-dir data/activations \\
+        --layers "7,15,23" --steps all \\
+        --prompt-suffix-indices "-3:-1" --output-indices "-16:-14"
 
     # Step 1: run IRL
     uv run python run_fixed_grid_maxent_irl.py [--n 50] [--epochs 50] [--lr 0.1]
@@ -35,8 +36,6 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-import torch
-from tqdm import tqdm
 
 # Re-use shared utilities from the one-step script
 from run_maxent_irl import (
@@ -44,7 +43,6 @@ from run_maxent_irl import (
     DELTA,
     FEATURE_NAMES,
     N_FEATURES,
-    apply_action,
     compute_features,
     parse_state,
     softmax,
@@ -54,13 +52,60 @@ from telos_interp.commands.prepare_activations_for_probing.prepare_activations_f
     load_activations_for_trajectory,
 )
 from telos_interp.commands.train_key_collected_probe import KeyCollectedProbe
+from tqdm import tqdm
 
-TRAJ_DIR = Path("data/trajectories/fixed_key_door_grid")
-ACTIVATION_DIR = Path("data/activations/activations_fixed_key_door_grid")
-PROBE_DIR = Path("data/activations/activations_key_door_env_100")
+TRAJ_DIR = Path("data/trajectories")
+ACTIVATION_DIR = Path("data/activations")
 
 # State tuple: (row, col, has_key: bool, door_open: bool)
 StateTuple = tuple[int, int, bool, bool]
+
+
+# ── Corrected transition model ──────────────────────────────────────────────
+
+
+def apply_action_fixed(state: dict, action: str) -> dict:
+    """Deterministic transition with correct door mechanics.
+
+    Differences from run_maxent_irl.apply_action:
+    - A locked door blocks movement (treated as impassable wall).
+    - The door opens automatically when the agent becomes adjacent
+      (Manhattan distance 1) to the door while carrying the key.
+    """
+    new = dict(state)
+    if action not in DELTA:
+        return new
+
+    dr, dc = DELTA[action]
+    r, c = state["agent_pos"]
+    nr, nc = r + dr, c + dc
+    gs = state["grid_size"]
+
+    # Wall or out-of-bounds → stay
+    if (nr, nc) in state["walls"] or not (0 <= nr < gs and 0 <= nc < gs):
+        return new
+
+    # Locked door blocks movement
+    door_pos = state["door_pos"]
+    door_locked = door_pos is not None and not state["door_open"]
+    if door_locked and (nr, nc) == door_pos:
+        return new
+
+    new["agent_pos"] = (nr, nc)
+
+    # Auto-collect key when stepping onto it
+    if state["key_pos"] == (nr, nc) and not state["has_key"]:
+        new["has_key"] = True
+        new["key_pos"] = None
+
+    # Auto-open door when adjacent (Manhattan dist 1) and carrying key
+    if door_locked and new["has_key"]:
+        ar, ac = new["agent_pos"]
+        if abs(ar - door_pos[0]) + abs(ac - door_pos[1]) == 1:
+            new["door_open"] = True
+            new["door_pos"] = None
+
+    return new
 
 
 # ── State conversion helpers ─────────────────────────────────────────────────
@@ -159,7 +204,7 @@ def build_transition_model(states: list[StateTuple], grid: dict) -> np.ndarray:
 
         s_dict = state_tuple_to_dict(s, grid)
         for j, action in enumerate(ACTIONS):
-            s_next = state_dict_to_tuple(apply_action(s_dict, action))
+            s_next = state_dict_to_tuple(apply_action_fixed(s_dict, action))
             T[i, j] = state_idx.get(s_next, i)  # fallback: stay
 
     return T
@@ -346,11 +391,11 @@ def run_maxent_irl(
 
     for epoch in range(num_epochs):
         # ── Backward pass: soft value iteration ────────────────────────────
-        R = phi @ theta       # (n_states,)  — reward for each state
+        R = phi @ theta  # (n_states,)  — reward for each state
         V = np.zeros(n_states)
 
         for _ in range(n):
-            Q = R[:, np.newaxis] + V[T]   # (n_states, n_actions)
+            Q = R[:, np.newaxis] + V[T]  # (n_states, n_actions)
             # Numerically stable logsumexp over actions
             Q_max = Q.max(axis=1, keepdims=True)
             V = Q_max[:, 0] + np.log(np.exp(Q - Q_max).sum(axis=1))
@@ -366,7 +411,7 @@ def run_maxent_irl(
         for _ in range(n):
             mu += mu_t
             mu_next = np.zeros(n_states)
-            weight = mu_t[:, np.newaxis] * pi   # (n_states, n_actions)
+            weight = mu_t[:, np.newaxis] * pi  # (n_states, n_actions)
             for a in range(n_actions):
                 np.add.at(mu_next, T[:, a], weight[:, a])
             mu_t = mu_next
@@ -374,14 +419,14 @@ def run_maxent_irl(
         mu /= mu.sum() if mu.sum() > 0 else 1.0
 
         # ── Gradient update ─────────────────────────────────────────────────
-        phi_policy = mu @ phi    # (N_FEATURES,)
+        phi_policy = mu @ phi  # (N_FEATURES,)
         grad = phi_demo - phi_policy
         theta += learning_rate * grad
 
         if (epoch + 1) % 10 == 0:
             grad_norm = float(np.linalg.norm(grad))
             max_gap = float(np.abs(grad).max())
-            print(f"  Epoch {epoch+1:3d}/{num_epochs}: ‖Δφ‖={grad_norm:.6f}  max_gap={max_gap:.6f}")
+            print(f"  Epoch {epoch + 1:3d}/{num_epochs}: ‖Δφ‖={grad_norm:.6f}  max_gap={max_gap:.6f}")
 
     return theta
 
@@ -399,7 +444,6 @@ def evaluate(
 ) -> dict:
     """Evaluate θ: action accuracy, log-likelihood, feature expectation gap."""
     n_states = len(state_idx)
-    n_actions = T.shape[1]
 
     # Re-run backward pass to get the policy under learned θ
     R = phi @ theta
@@ -445,7 +489,7 @@ def print_results(theta: np.ndarray, metrics: dict) -> None:
     print("\n" + "=" * 55)
     print("LEARNED REWARD WEIGHTS θ  (R(s) = θ^T φ(s))")
     print("=" * 55)
-    for name, w in zip(FEATURE_NAMES, theta):
+    for name, w in zip(FEATURE_NAMES, theta, strict=False):
         pct = 100 * abs(w) / total_abs
         sign = "+" if w >= 0 else ""
         print(f"  {name:<12} {sign}{w:9.4f}   ({pct:4.1f}%)")
@@ -463,10 +507,10 @@ def print_results(theta: np.ndarray, metrics: dict) -> None:
     print(f"  Log-likelihood:  {ll:>8.4f}  (random: {ll_base:.4f})")
     print(f"  Action accuracy: {acc:>7.1%}  (random: {acc_base:.1%})")
     print()
-    print(f"  Feature expectation gap  (demo − policy):")
+    print("  Feature expectation gap  (demo − policy):")
     print(f"  {'Feature':<12} {'Gap':>12}")
     print(f"  {'-' * 26}")
-    for name, g in zip(FEATURE_NAMES, gap):
+    for name, g in zip(FEATURE_NAMES, gap, strict=False):
         ok = "✓" if abs(g) < 0.01 else ("~" if abs(g) < 0.05 else "✗ large")
         print(f"  {name:<12} {g:>12.6f}  {ok}")
     print("=" * 55)
@@ -476,25 +520,34 @@ def print_results(theta: np.ndarray, metrics: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="n-Step MaxEnt IRL on a single fixed key-door grid."
+    parser = argparse.ArgumentParser(description="n-Step MaxEnt IRL on a single fixed key-door grid.")
+    parser.add_argument(
+        "--n", type=int, default=50, help="Backward/forward horizon (default: 50; covers the full task)"
     )
-    parser.add_argument("--n", type=int, default=50,
-                        help="Backward/forward horizon (default: 50; covers the full task)")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Training epochs (default: 50)")
-    parser.add_argument("--lr", type=float, default=0.1,
-                        help="Learning rate (default: 0.1)")
-    parser.add_argument("--token-category", choices=["pre", "post"], default="post",
-                        help="Activation category for probe features: 'pre' (prompt suffix last token) "
-                             "or 'post' (output last token). Default: post")
+    parser.add_argument("--epochs", type=int, default=50, help="Training epochs (default: 50)")
+    parser.add_argument("--lr", type=float, default=0.1, help="Learning rate (default: 0.1)")
+    parser.add_argument(
+        "--token-category",
+        choices=["pre", "post"],
+        default="post",
+        help="Activation category for probe features: 'pre' (prompt suffix last token) "
+        "or 'post' (output last token). Default: post",
+    )
+    parser.add_argument(
+        "--probe-dir",
+        type=str,
+        default=None,
+        help="Directory containing key_collected_probe_mlp.pt and "
+        "door_open_probe_mlp.pt. If omitted or probes not found, "
+        "binary proxies (has_key, door_open) are used for p_key/p_door.",
+    )
     args = parser.parse_args()
 
     print(f"n-Step MaxEnt IRL  (n={args.n}, epochs={args.epochs}, lr={args.lr})")
 
     print("\n=== Phase 1: Loading fixed grid ===")
     grid = load_fixed_grid(TRAJ_DIR)
-    print(f"  Grid size:  {grid['grid_size']}×{grid['grid_size']}")
+    print(f"  Grid size:  {grid['grid_size']}x{grid['grid_size']}")
     print(f"  Key start:  {grid['key_start_pos']}")
     print(f"  Door start: {grid['door_start_pos']}")
     print(f"  Goal:       {grid['goal_pos']}")
@@ -512,13 +565,29 @@ def main() -> None:
     demonstrations = load_demonstrations(TRAJ_DIR)
 
     print("\n=== Phase 5: Loading probes ===")
-    key_probe = KeyCollectedProbe.load(PROBE_DIR / "key_collected_probe_mlp.pt")
-    door_probe = KeyCollectedProbe.load(PROBE_DIR / "door_open_probe_mlp.pt")
-    print("  Probes loaded.")
+    probe_lookup: dict[StateTuple, tuple[float, float]] = {}
+    probe_dir = Path(args.probe_dir) if args.probe_dir else None
+    if probe_dir is not None:
+        key_path = probe_dir / "key_collected_probe_mlp.pt"
+        door_path = probe_dir / "door_open_probe_mlp.pt"
+        if key_path.exists() and door_path.exists():
+            key_probe = KeyCollectedProbe.load(key_path)
+            door_probe = KeyCollectedProbe.load(door_path)
+            print("  Probes loaded.")
 
-    print("\n=== Phase 6: Building probe lookup ===")
-    probe_lookup = build_probe_lookup(ACTIVATION_DIR, TRAJ_DIR, key_probe, door_probe,
-                                      token_category=args.token_category)
+            print("\n=== Phase 6: Building probe lookup ===")
+            probe_lookup = build_probe_lookup(
+                ACTIVATION_DIR,
+                TRAJ_DIR,
+                key_probe,
+                door_probe,
+                token_category=args.token_category,
+            )
+        else:
+            print(f"  Probe files not found in {probe_dir}")
+            print("  Using binary proxies for p_key / p_door.")
+    else:
+        print("  No --probe-dir specified; using binary proxies for p_key / p_door.")
 
     print("\n=== Phase 7: Pre-computing feature table ===")
     phi = compute_phi_table(states, grid, probe_lookup)
