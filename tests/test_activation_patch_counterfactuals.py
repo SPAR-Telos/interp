@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from telos_interp.commands.activation_patch_counterfactuals.activation_patch_counterfactuals_fn import (
+    PATCH_SITE_ALL_GRID_TOKENS,
     PATCH_SITE_MODIFIED_GRID_CELLS,
     PATCH_SITE_PRE_FINAL_BOUNDARY,
     PATCH_SITE_PROMPT_BOUNDARY,
@@ -18,6 +19,7 @@ from telos_interp.commands.activation_patch_counterfactuals.activation_patch_cou
     compute_outcome_flags,
     discover_patch_pairs,
     extract_action_from_text,
+    resolve_all_grid_token_ids,
     resolve_modified_grid_cell_token_ids,
     resolve_pre_final_boundary_token_ids,
     resolve_prompt_boundary_token_ids,
@@ -151,6 +153,16 @@ def test_resolve_modified_grid_cell_token_ids_requires_one_token_per_cell():
         assert "exactly one grid_tile token per grid cell" in str(exc)
     else:
         raise AssertionError("Expected ValueError for non-cell-aligned grid tokens")
+
+
+def test_resolve_all_grid_token_ids_uses_full_grid_state_sequence():
+    grid_tokens = [
+        {"id": 0, "token": "row", "token_id": 1, "token_groups": ["grid_state"]},
+        {"id": 1, "token": "A", "token_id": 2, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 2, "token": " ", "token_id": 3, "token_groups": ["grid_state"]},
+        {"id": 3, "token": "B", "token_id": 4, "token_groups": ["grid_state", "grid_tile"]},
+    ]
+    assert resolve_all_grid_token_ids(grid_tokens) == [0, 1, 2, 3]
 
 
 def test_resolve_action_token_prefers_final_action_token():
@@ -343,6 +355,34 @@ def test_build_answer_forcing_input_modified_grid_cells_uses_grid_offset():
     )
 
     assert forced["absolute_positions"] == [3, 6]
+
+
+def test_build_answer_forcing_input_all_grid_tokens_uses_full_grid_span():
+    class FakeTokenizer:
+        mapping = {'"UP"': 11, '"DOWN"': 12, '"LEFT"': 13, '"RIGHT"': 14}
+
+        def encode(self, text, add_special_tokens=False):
+            return [self.mapping[text]]
+
+    class FakeModel:
+        tokenizer = FakeTokenizer()
+
+    trajectory = _make_trajectory("DOWN")
+    trajectory["steps"][0]["grid_state_tokens"] = [
+        {"id": 0, "token": "header", "token_id": 30, "token_groups": ["grid_state"]},
+        {"id": 1, "token": "A", "token_id": 31, "token_groups": ["grid_state", "grid_tile"]},
+        {"id": 2, "token": " ", "token_id": 32, "token_groups": ["grid_state"]},
+        {"id": 3, "token": "B", "token_id": 33, "token_groups": ["grid_state", "grid_tile"]},
+    ]
+
+    forced = _build_answer_forcing_input(
+        FakeModel(),
+        trajectory,
+        step_idx=0,
+        patch_site=PATCH_SITE_ALL_GRID_TOKENS,
+    )
+
+    assert forced["absolute_positions"] == [2, 3, 4, 5]
 
 
 def test_activation_patch_counterfactuals_smoke(monkeypatch, tmp_path: Path):

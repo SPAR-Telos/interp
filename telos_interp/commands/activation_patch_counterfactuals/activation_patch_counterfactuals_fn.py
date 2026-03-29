@@ -25,9 +25,15 @@ VALID_ACTIONS = ("UP", "DOWN", "LEFT", "RIGHT")
 PATCH_SITE_PROMPT_BOUNDARY = "prompt_boundary"
 PATCH_SITE_PRE_FINAL_BOUNDARY = "pre_final_boundary"
 PATCH_SITE_MODIFIED_GRID_CELLS = "modified_grid_cells"
+PATCH_SITE_ALL_GRID_TOKENS = "all_grid_tokens"
 EXPECTED_BOUNDARY_TOKENS = ("<|end|>", "<|start|>", "assistant")
 EXPECTED_FINAL_PREFIX = ("<|channel|>", "final", "<|message|>")
-VALID_PATCH_SITES = (PATCH_SITE_PROMPT_BOUNDARY, PATCH_SITE_PRE_FINAL_BOUNDARY, PATCH_SITE_MODIFIED_GRID_CELLS)
+VALID_PATCH_SITES = (
+    PATCH_SITE_PROMPT_BOUNDARY,
+    PATCH_SITE_PRE_FINAL_BOUNDARY,
+    PATCH_SITE_MODIFIED_GRID_CELLS,
+    PATCH_SITE_ALL_GRID_TOKENS,
+)
 VALID_DIRECTIONS = ("original_to_counterfactual", "counterfactual_to_original")
 VALID_RELATIONS = ("same", "disjoint", "overlap")
 VALID_COUNTERFACTUAL_TYPES = ("agent_moved", "goal_moved")
@@ -197,6 +203,16 @@ def resolve_modified_grid_cell_token_ids(
     return unique_ids
 
 
+def resolve_all_grid_token_ids(grid_state_tokens: list[dict[str, Any]]) -> list[int]:
+    """Resolve all token ids that make up the serialized grid."""
+    token_ids = [int(token["id"]) for token in grid_state_tokens]
+    if not token_ids:
+        raise ValueError("all_grid_tokens requires at least one grid_state token.")
+    if len(set(token_ids)) != len(token_ids):
+        raise ValueError("all_grid_tokens requires unique token ids in grid_state_tokens.")
+    return token_ids
+
+
 def _build_input_ids_for_patch_site(
     trajectory: dict[str, Any],
     step_idx: int,
@@ -247,6 +263,18 @@ def _build_input_ids_for_patch_site(
             input_ids = prefix_ids + grid_ids + suffix_ids
         else:
             raise ValueError(f"Unsupported target_mode for modified_grid_cells: {target_mode}")
+        remaining_tokens = len(output_ids)
+        return input_ids, absolute_positions, remaining_tokens
+
+    if patch_site == PATCH_SITE_ALL_GRID_TOKENS:
+        relative_positions = resolve_all_grid_token_ids(step["grid_state_tokens"])
+        absolute_positions = [len(prefix_ids) + position for position in relative_positions]
+        if target_mode == "capture":
+            input_ids = prefix_ids + grid_ids
+        elif target_mode == "free_generation":
+            input_ids = prefix_ids + grid_ids + suffix_ids
+        else:
+            raise ValueError(f"Unsupported target_mode for all_grid_tokens: {target_mode}")
         remaining_tokens = len(output_ids)
         return input_ids, absolute_positions, remaining_tokens
 
@@ -338,6 +366,9 @@ def _build_answer_forcing_input(
         relative_positions = resolve_modified_grid_cell_token_ids(
             step["grid_state_tokens"], grid_size, modified_positions
         )
+        absolute_positions = [len(prefix_ids) + position for position in relative_positions]
+    elif patch_site == PATCH_SITE_ALL_GRID_TOKENS:
+        relative_positions = resolve_all_grid_token_ids(step["grid_state_tokens"])
         absolute_positions = [len(prefix_ids) + position for position in relative_positions]
     else:
         raise ValueError(f"Unsupported patch_site: {patch_site}")

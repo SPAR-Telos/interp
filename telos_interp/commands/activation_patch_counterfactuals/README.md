@@ -7,6 +7,7 @@ The command patches semantic boundary tokens rather than arbitrary token slices:
 - `prompt_boundary`: the `"<|end|>"`, `"<|start|>"`, `"assistant"` triplet in `prompt_suffix_tokens`
 - `pre_final_boundary`: the same triplet immediately before `"<|channel|>", "final", "<|message|>"` in `output_tokens`
 - `modified_grid_cells`: only the two moved grid cells from the counterfactual metadata (`from_position`, `to_position`)
+- `all_grid_tokens`: every token in `grid_state_tokens`, i.e. the full serialized grid span
 
 `modified_grid_cells` requires exactly one `grid_tile` token per grid cell in `grid_state_tokens`; otherwise the run will fail fast rather than guess a token mapping.
 

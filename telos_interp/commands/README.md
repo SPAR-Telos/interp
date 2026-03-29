@@ -46,7 +46,7 @@ Default evaluation is `answer_forcing`, which teacher-forces the output prefix u
 | `--counterfactual-metadata-root` | Root directory with counterfactual grid metadata |
 | `--counterfactual-trajectories-dir` | Directory with generated counterfactual trajectories |
 | `--original-trajectories-dir` | Directory with original trajectories |
-| `--patch-sites` | Patch sites to patch (`prompt_boundary`, `pre_final_boundary`, `modified_grid_cells`) |
+| `--patch-sites` | Patch sites to patch (`prompt_boundary`, `pre_final_boundary`, `modified_grid_cells`, `all_grid_tokens`) |
 | `--layers` | Layer indices to evaluate |
 | `--output-dir` | Directory for manifest and statistics outputs |
 
