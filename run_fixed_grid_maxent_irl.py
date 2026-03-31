@@ -55,7 +55,7 @@ from telos_interp.commands.train_key_collected_probe import KeyCollectedProbe
 from tqdm import tqdm
 
 TRAJ_DIR = Path("data/trajectories")
-ACTIVATION_DIR = Path("data/activations")
+ACTIVATION_DIR = Path("data/activations/activations_fixed_key_door_grid")
 
 # State tuple: (row, col, has_key: bool, door_open: bool)
 StateTuple = tuple[int, int, bool, bool]
