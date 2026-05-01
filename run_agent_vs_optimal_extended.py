@@ -1,14 +1,25 @@
-"""Extended Cost-IRL: agent action vs BFS-optimal action.
+"""Cost-IRL: agent action vs BFS-optimal action.
+
+Algorithm (next-state averaged-φ form, ported from `cost_updated.ipynb`):
+
+  - φ(s) = mean of activations across all visits to state s (one φ per state)
+  - Single θ ∈ ℝ^{phi_dim};  cost(s) = θᵀ · φ(s)
+  - Policy:  P(a | s) = softmax(−β · cost(f(s, a)))
+  - For each (s_t, a_t) transition we look up φ(f(s, a)) for all 4 actions;
+    transitions whose next state was never observed are dropped.
 
 Runs 8 configurations per dataset:
   model_type ∈ {linear, mlp}  ×  token ∈ {pre, post}  ×  label ∈ {agent, optimal}
 
-For each (model, token) pair we train one Model A (agent label) and one
-Model B (optimal label) — 4 pairs per dataset.
+Outputs `<dataset>_agent_vs_optimal_extended.{pkl,json}` under results/.
 
 Datasets:
-  - Seed12               (data/trajectories/Seed12, varied starts, hard 9x9)
-  - two_path_no_key_T0   (data/trajectories/two_path_no_key_T0, fixed start, easy 7x8)
+  - Seed12               (data/trajectories/Seed12)
+  - two_path_no_key_T0   (data/trajectories/two_path_no_key_T0)
+
+Both datasets have constant (carrying_key, door_open) across all steps,
+so the transition function is plain 4-direction movement that stops at
+walls and the goal.
 """
 from __future__ import annotations
 import argparse
@@ -46,15 +57,15 @@ DATASETS = {
         name="seed12",
         traj_dir=Path("/Users/wws/interp/data/trajectories/Seed12"),
         act_dir=Path("/Users/wws/interp/data/activations/Seed12"),
-        out_pkl=Path("/Users/wws/interp/results/seed12_agent_vs_optimal_per_visit.pkl"),
-        out_json=Path("/Users/wws/interp/results/seed12_agent_vs_optimal_per_visit.json"),
+        out_pkl=Path("/Users/wws/interp/results/seed12_agent_vs_optimal_extended.pkl"),
+        out_json=Path("/Users/wws/interp/results/seed12_agent_vs_optimal_extended.json"),
     ),
     "two_path": DatasetCfg(
         name="two_path",
         traj_dir=Path("/Users/wws/interp/data/trajectories/two_path_no_key_T0"),
         act_dir=Path("/Users/wws/interp/data/activations/two_path_no_key_T0"),
-        out_pkl=Path("/Users/wws/interp/results/two_path_agent_vs_optimal_per_visit.pkl"),
-        out_json=Path("/Users/wws/interp/results/two_path_agent_vs_optimal_per_visit.json"),
+        out_pkl=Path("/Users/wws/interp/results/two_path_agent_vs_optimal_extended.pkl"),
+        out_json=Path("/Users/wws/interp/results/two_path_agent_vs_optimal_extended.json"),
     ),
 }
 
@@ -63,7 +74,7 @@ A2I = {a: i for i, a in enumerate(ACTIONS)}
 DELTAS = {"LEFT": (-1, 0), "RIGHT": (1, 0), "UP": (0, -1), "DOWN": (0, 1)}
 
 
-def parse_grid(traj_dir):
+def parse_grid(traj_dir: Path):
     with open(traj_dir / "grid_layout.json") as f:
         gl = json.load(f)
     grid_text_lines = gl["grid_text"].rstrip("\n").split("\n")
@@ -82,7 +93,7 @@ def parse_grid(traj_dir):
     return H, W, walls, walkable, GOAL
 
 
-def make_step(walls, walkable, W, H, GOAL):
+def make_step(walls, W, H, GOAL):
     def step(pos, action):
         if pos == GOAL:
             return pos
@@ -143,130 +154,113 @@ def load_activation(act_dir, traj_stem, step_id, token_pos):
     return torch.cat(vecs, dim=0).numpy()
 
 
-def collect_records(cfg, walkable, GOAL, optimal_set, step, token_pos):
-    """Walk trajectories and build per-visit records.
+def collect_records(cfg, GOAL, optimal_set, token_pos):
+    """Walk trajectories. Each (traj, step_id) becomes one record.
 
-    Each (trajectory, step_id, position) visit becomes its own record with
-    its own raw 8640-dim phi. *No averaging across visits.*
+    state = (col, row, carrying_key, door_open). For Seed12 / two_path
+    these flags are constant across each dataset, so state effectively
+    reduces to (col, row), but we keep the full tuple for parity with
+    cost_updated.ipynb.
     """
     records = []
-    n_total = skipped_no_phi = skipped_no_pos = skipped_at_goal = skipped_no_optimal = 0
-    states_seen = set()
-
+    skipped = Counter()
+    n_total = 0
     for tp in sorted(cfg.traj_dir.glob("together_ai*.json")):
         with open(tp) as f:
             tj = json.load(f)
         stem = tp.stem
         for s in tj["steps"]:
             n_total += 1
-            sid = s["step_id"]
             action = s.get("agent_action")
             if action not in A2I:
-                continue
+                skipped["bad_action"] += 1; continue
             pos = parse_agent_pos(s["grid_state"])
             if pos is None:
-                skipped_no_pos += 1; continue
+                skipped["no_pos"] += 1; continue
             if pos == GOAL:
-                skipped_at_goal += 1; continue
+                skipped["at_goal"] += 1; continue
             if pos not in optimal_set or not optimal_set[pos]:
-                skipped_no_optimal += 1; continue
-            phi = load_activation(cfg.act_dir, stem, sid, token_pos)
+                skipped["no_optimal"] += 1; continue
+            phi = load_activation(cfg.act_dir, stem, s["step_id"], token_pos)
             if phi is None:
-                skipped_no_phi += 1; continue
-            state = (pos[0], pos[1], False, False)
-            states_seen.add(state)
+                skipped["no_phi"] += 1; continue
+            has_key = bool(s.get("carrying_key", False))
+            door_open = bool(s.get("door_open", False))
+            state = (pos[0], pos[1], has_key, door_open)
             opt = optimal_set[pos]
             opt_label = action if action in opt else opt[0]
-            records.append({"state": state, "phi": phi, "agent_action": action,
-                            "opt_label": opt_label, "opt_set": opt})
-    return records, states_seen, {
-        "n_total_steps": n_total, "skipped_no_phi": skipped_no_phi,
-        "skipped_no_pos": skipped_no_pos, "skipped_at_goal": skipped_at_goal,
-        "skipped_no_optimal": skipped_no_optimal,
-    }
+            records.append({
+                "state": state, "phi": phi,
+                "agent_action": action, "opt_label": opt_label,
+                "opt_set": opt,
+            })
+    return records, dict(skipped), n_total
 
 
-def build_tensors(records, states_seen, step):
-    """Per-visit phi tensors. No state-level averaging anywhere.
+def build_phi_table(records):
+    """Average φ across all visits to the same state."""
+    state_phis = defaultdict(list)
+    for rec in records:
+        state_phis[rec["state"]].append(rec["phi"])
+    return {s: np.stack(phis).mean(axis=0) for s, phis in state_phis.items()}
 
-    phi_visit[i] is the i-th record's own raw 8640-dim activation at its
-    visit (no averaging). The cost model is reformulated to use this
-    per-visit feature directly with a *per-action* head — see
-    LinearCostIRL_PerVisit / MLPCostIRL_PerVisit below — instead of the
-    next-state-cost framing of the original cost_updated.ipynb (which
-    inherently requires phi(next_state) for 3 counterfactual actions and
-    therefore *some* state-level summary).
 
-    Per-action cost:
-        C_θ(s, a) = (θ_a)ᵀ · phi(s)
-        P(a | s) = softmax_a(−β · C_θ(s, a))
+def build_dataset(records, phi_table, step):
+    """Build the next-state-indexed training set.
 
-    Each visit ⇒ one training row with phi = per-visit activation, label
-    = the visit's action label.
+    For each record we compute f(s, a) for all 4 actions. If any next
+    state has no entry in phi_table the record is dropped (mirrors
+    cost_updated.ipynb).
     """
-    state_list = sorted(states_seen)
+    state_list = sorted(phi_table.keys())
     s2i = {s: i for i, s in enumerate(state_list)}
-    PHI_DIM = records[0]["phi"].shape[0]
+    phi_matrix = torch.tensor(np.stack([phi_table[s] for s in state_list]),
+                              dtype=torch.float32)
+    phi_mean = phi_matrix.mean(0, keepdim=True)
+    phi_std = phi_matrix.std(0, keepdim=True) + 1e-8
+    phi_matrix_norm = (phi_matrix - phi_mean) / phi_std
 
-    # Drop records whose state has any neighbouring next-state outside the
-    # observed state set (kept for parity with the averaged version, although
-    # in this per-visit formulation we don't actually look up next-state
-    # features; we still drop these records to keep the comparison apples-to-
-    # apples with the averaged runs).
-    kept = []
+    next_idx, agent_labels, opt_labels, opt_sets = [], [], [], []
     dropped = 0
     for rec in records:
-        c, r, _, _ = rec["state"]
-        ok = True
+        c, r, has_key, door_open = rec["state"]
+        rows, valid = [], True
         for a in ACTIONS:
-            nxt_pos = step((c, r), a)
-            if (nxt_pos[0], nxt_pos[1], False, False) not in s2i:
-                ok = False; break
-        if not ok:
+            nc, nr = step((c, r), a)
+            ns = (nc, nr, has_key, door_open)   # flags constant in our datasets
+            if ns not in s2i:
+                valid = False; break
+            rows.append(s2i[ns])
+        if not valid:
             dropped += 1; continue
-        kept.append(rec)
-
-    phi_visit = torch.tensor(np.stack([rec["phi"] for rec in kept]),
-                             dtype=torch.float32)
-    # Z-normalise using stats from the per-visit matrix only.
-    mean = phi_visit.mean(0, keepdim=True)
-    std = phi_visit.std(0, keepdim=True) + 1e-8
-    phi_visit_norm = (phi_visit - mean) / std
-
-    agent_labels = torch.tensor([A2I[rec["agent_action"]] for rec in kept],
-                                dtype=torch.long)
-    opt_labels = torch.tensor([A2I[rec["opt_label"]] for rec in kept],
-                              dtype=torch.long)
-    opt_sets = [[A2I[a] for a in rec["opt_set"]] for rec in kept]
-
-    return (phi_visit_norm, agent_labels, opt_labels, opt_sets,
-            PHI_DIM, len(state_list), dropped)
+        next_idx.append(rows)
+        agent_labels.append(A2I[rec["agent_action"]])
+        opt_labels.append(A2I[rec["opt_label"]])
+        opt_sets.append([A2I[a] for a in rec["opt_set"]])
+    return (
+        torch.tensor(next_idx, dtype=torch.long),
+        torch.tensor(agent_labels, dtype=torch.long),
+        torch.tensor(opt_labels, dtype=torch.long),
+        opt_sets, phi_matrix_norm, state_list, dropped,
+    )
 
 
-# ── models (per-visit, per-action head) ────────────────────────────────
+# ── models: single θ over next-state φ ─────────────────────────────────
 class LinearCostIRL(nn.Module):
-    """Per-visit linear cost-IRL.
-
-    C_θ(s, a) = (θ_a)ᵀ · phi(s)
-    P(a | s) = softmax(−β · C_θ(s, a))
-
-    Equivalent to multinomial logistic regression with weight matrix
-    W = −β · θ ∈ ℝ^{4 × phi_dim}; framed as cost-IRL for continuity with
-    the averaged version of the experiment.
-    """
-    def __init__(self, phi_dim, n_actions=4, beta=1.0):
+    """cost(s) = θᵀ · φ(s);  P(a|s) = softmax(−β · cost(f(s, a)))."""
+    def __init__(self, phi_dim, beta=1.0):
         super().__init__()
-        self.theta = nn.Parameter(torch.zeros(n_actions, phi_dim))
+        self.theta = nn.Parameter(torch.zeros(phi_dim))
         self.beta = beta
 
-    def forward(self, phi):                         # phi: (N, phi_dim)
-        costs = phi @ self.theta.T                  # (N, n_actions)
+    def forward(self, phi_next):                       # (N, 4, phi_dim)
+        costs = torch.einsum("naf,f->na", phi_next, self.theta)
         return torch.log_softmax(-self.beta * costs, dim=-1)
 
 
 class MLPCostIRL(nn.Module):
-    """Per-visit MLP cost-IRL — 8640 → 128 → 128 → 4 logits."""
-    def __init__(self, phi_dim, hidden_dim=128, n_actions=4, beta=1.0, dropout=0.1):
+    """cost(s) = MLP(φ(s));  P(a|s) = softmax(−β · cost(f(s, a)))."""
+    def __init__(self, phi_dim, hidden_dim=128, beta=1.0, dropout=0.1):
         super().__init__()
         self.beta = beta
         self.net = nn.Sequential(
@@ -274,19 +268,20 @@ class MLPCostIRL(nn.Module):
             nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_actions),
+            nn.Linear(hidden_dim, 1),
         )
         nn.init.xavier_uniform_(self.net[0].weight, gain=0.1)
         nn.init.xavier_uniform_(self.net[3].weight, gain=0.1)
         nn.init.zeros_(self.net[6].weight)
 
-    def forward(self, phi):
-        costs = self.net(phi)                       # (N, n_actions)
+    def forward(self, phi_next):                       # (N, 4, phi_dim)
+        costs = self.net(phi_next).squeeze(-1)         # (N, 4)
         return torch.log_softmax(-self.beta * costs, dim=-1)
 
 
-def train_one(model_type, phi_dim, phi_visit, labels, train_idx, test_idx, name):
+def train_one(model_type, phi_next, labels, train_idx, test_idx):
     torch.manual_seed(SEED)
+    phi_dim = phi_next.shape[-1]
     if model_type == "linear":
         model = LinearCostIRL(phi_dim, beta=BETA)
         opt = optim.Adam([model.theta], lr=LR)
@@ -294,11 +289,11 @@ def train_one(model_type, phi_dim, phi_visit, labels, train_idx, test_idx, name)
         model = MLPCostIRL(phi_dim, hidden_dim=HIDDEN_DIM, beta=BETA, dropout=DROPOUT)
         opt = optim.Adam(model.parameters(), lr=LR, weight_decay=REG)
     sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N_EPOCHS)
-    phi_tr, y_tr = phi_visit[train_idx], labels[train_idx]
-    phi_te, y_te = phi_visit[test_idx], labels[test_idx]
+    phi_tr, y_tr = phi_next[train_idx], labels[train_idx]
+    phi_te, y_te = phi_next[test_idx], labels[test_idx]
     best_te_ll = -np.inf
     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    for epoch in range(N_EPOCHS):
+    for _ in range(N_EPOCHS):
         model.train()
         opt.zero_grad()
         logp = model(phi_tr)
@@ -311,8 +306,7 @@ def train_one(model_type, phi_dim, phi_visit, labels, train_idx, test_idx, name)
         opt.step()
         sch.step()
         with torch.no_grad():
-            logp_te = model(phi_te)
-            te_ll = -nn.functional.nll_loss(logp_te, y_te).item()
+            te_ll = -nn.functional.nll_loss(model(phi_te), y_te).item()
         if te_ll > best_te_ll:
             best_te_ll = te_ll
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -320,10 +314,10 @@ def train_one(model_type, phi_dim, phi_visit, labels, train_idx, test_idx, name)
     return model
 
 
-def eval_model(model, labels, phi_visit, opt_sets, idx):
+def eval_model(model, labels, phi_next, opt_sets, idx):
     model.eval()
     with torch.no_grad():
-        logp = model(phi_visit[idx])
+        logp = model(phi_next[idx])
         preds = logp.argmax(-1)
         ll = -nn.functional.nll_loss(logp, labels[idx]).item()
         acc = (preds == labels[idx]).float().mean().item()
@@ -343,58 +337,60 @@ def run_dataset(dataset_key, datasets):
     cfg = datasets[dataset_key]
     print(f"\n{'='*70}\n{cfg.name.upper()}\n{'='*70}")
     H, W, walls, walkable, GOAL = parse_grid(cfg.traj_dir)
-    step = make_step(walls, walkable, W, H, GOAL)
+    step = make_step(walls, W, H, GOAL)
     dist, optimal_set = bfs_optimal(walkable, GOAL, step)
     print(f"Grid {W}x{H}, walkable={len(walkable)}, goal={GOAL}, "
           f"BFS-reached={len(dist)}/{len(walkable)}")
 
     all_results = {}
-    # For each token category we re-collect activations (different files).
     for token_pos in ["prompt_suffix", "output"]:
         token_label = "pre" if token_pos == "prompt_suffix" else "post"
         print(f"\n--- token = {token_label} ({token_pos}) ---")
         torch.manual_seed(SEED); np.random.seed(SEED)
-        records, states_seen, drop_stats = collect_records(
-            cfg, walkable, GOAL, optimal_set, step, token_pos)
-        phi_visit, agent_labels, opt_labels, opt_sets, PHI_DIM, n_states, drop_t = \
-            build_tensors(records, states_seen, step)
+        records, drop_stats, n_total = collect_records(cfg, GOAL, optimal_set, token_pos)
+        phi_table = build_phi_table(records)
+        next_idx, agent_labels, opt_labels, opt_sets, phi_mat_norm, state_list, dropped = \
+            build_dataset(records, phi_table, step)
         N = len(agent_labels)
+
+        # Materialise φ-of-next-state once: (N, 4, phi_dim)
+        phi_next = phi_mat_norm[next_idx]
+
         rng = np.random.default_rng(SEED)
         perm = rng.permutation(N)
         n_test = int(N * TEST_FRAC)
         test_idx = torch.tensor(perm[:n_test], dtype=torch.long)
         train_idx = torch.tensor(perm[n_test:], dtype=torch.long)
+
         agent_is_optimal = sum(int(a.item() in s) for a, s in zip(agent_labels, opt_sets))
         agent_dist = Counter(int(a) for a in agent_labels.tolist())
         opt_dist = Counter(int(a) for a in opt_labels.tolist())
         meta = {
-            "n_records": int(N), "n_unique_states": int(n_states),
-            "phi_dim": int(PHI_DIM), "n_train": int(len(train_idx)),
-            "n_test": int(len(test_idx)),
-            "drop_filter": drop_stats, "dropped_no_next_phi": int(drop_t),
+            "n_records": int(N), "n_unique_states": len(state_list),
+            "phi_dim": int(phi_mat_norm.shape[1]),
+            "n_train": int(len(train_idx)), "n_test": int(len(test_idx)),
+            "drop_filter": drop_stats, "dropped_no_next_phi": int(dropped),
+            "n_total_steps": int(n_total),
             "agent_action_dist": {ACTIONS[i]: int(agent_dist[i]) for i in range(4)},
             "optimal_action_dist": {ACTIONS[i]: int(opt_dist[i]) for i in range(4)},
             "agent_is_optimal_frac": agent_is_optimal / N,
             "majority_baseline_agent": max(agent_dist.values()) / N,
             "majority_baseline_opt": max(opt_dist.values()) / N,
         }
-        print(f"  N={N} records, {n_states} states, phi_dim={PHI_DIM}, "
+        print(f"  N={N} records, {len(state_list)} states, phi_dim={phi_mat_norm.shape[1]}, "
               f"agent-optimal={agent_is_optimal/N:.3f}")
 
         for model_type in ["linear", "mlp"]:
             for label_kind, labels in [("agent", agent_labels), ("optimal", opt_labels)]:
                 key = f"{model_type}__{token_label}__{label_kind}"
                 print(f"  training [{key}] ...", end=" ", flush=True)
-                model = train_one(model_type, PHI_DIM, phi_visit, labels,
-                                  train_idx, test_idx, key)
-                tr = eval_model(model, labels, phi_visit, opt_sets, train_idx)
-                te = eval_model(model, labels, phi_visit, opt_sets, test_idx)
-                # cross: model trained on `labels` scored against the OTHER labels
+                model = train_one(model_type, phi_next, labels, train_idx, test_idx)
+                tr = eval_model(model, labels, phi_next, opt_sets, train_idx)
+                te = eval_model(model, labels, phi_next, opt_sets, test_idx)
                 other = opt_labels if label_kind == "agent" else agent_labels
-                cross = eval_model(model, other, phi_visit, opt_sets, test_idx)
+                cross = eval_model(model, other, phi_next, opt_sets, test_idx)
                 all_results[key] = {"train": tr, "test": te, "cross": cross}
-                print(f"test_acc={te['acc']:.3f}  in_opt={te['in_opt_acc']:.3f}  "
-                      f"ll={te['ll']:.4f}")
+                print(f"test_acc={te['acc']:.3f}  in_opt={te['in_opt_acc']:.3f}  ll={te['ll']:.4f}")
         all_results[f"meta__{token_label}"] = meta
 
     cfg.out_pkl.parent.mkdir(parents=True, exist_ok=True)
