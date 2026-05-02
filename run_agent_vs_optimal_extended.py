@@ -90,10 +90,13 @@ def parse_grid(traj_dir: Path):
     walls = {(c, r) for r in range(H) for c in range(W) if grid_layout[r][c] == "#"}
     walkable = {(c, r) for r in range(H) for c in range(W) if grid_layout[r][c] != "#"}
     GOAL = tuple(gl["goal_pos"])
-    return H, W, walls, walkable, GOAL
+    KEY = next(((c, r) for r in range(H) for c in range(W) if grid_layout[r][c] == "K"), None)
+    DOOR = next(((c, r) for r in range(H) for c in range(W) if grid_layout[r][c] == "D"), None)
+    return H, W, walls, walkable, GOAL, KEY, DOOR
 
 
 def make_step(walls, W, H, GOAL):
+    """Position-only step, used for BFS / optimal-action-set computation."""
     def step(pos, action):
         if pos == GOAL:
             return pos
@@ -104,6 +107,37 @@ def make_step(walls, W, H, GOAL):
             return pos
         return (nc, nr)
     return step
+
+
+def make_step_state(walls, W, H, GOAL, KEY, DOOR):
+    """Full-state transition: (col, row, has_key, door_open) → next state.
+
+    - Walls/out-of-bounds: stay.
+    - Door cell is treated as walkable (matches `grid_text` parsing and
+      Seed12's env: agents in `door_open` variants traverse it freely;
+      agents in `standard`/`has_key` variants visibly cannot, but the
+      action set is movement-only — no `toggle` — so we never *update*
+      `door_open` here either way).
+    - Key pickup: walking onto the key cell with `has_key=False` flips
+      `has_key` to True. This is the only flag transition observable
+      in Seed12.
+    - The goal is terminal.
+    """
+    def f(state, action):
+        col, row, has_key, door_open = state
+        if (col, row) == GOAL:
+            return state
+        dc, dr = DELTAS[action]
+        nc, nr = col + dc, row + dr
+        if not (0 <= nc < W and 0 <= nr < H):
+            return state
+        if (nc, nr) in walls:
+            return state
+        new_has_key = has_key
+        if KEY is not None and (nc, nr) == KEY and not has_key:
+            new_has_key = True
+        return (nc, nr, new_has_key, door_open)
+    return f
 
 
 def bfs_optimal(walkable, GOAL, step):
@@ -197,20 +231,24 @@ def collect_records(cfg, GOAL, optimal_set, token_pos):
             state = (pos[0], pos[1], has_key, door_open)
             opt = optimal_set[pos]
             opt_label = action if action in opt else opt[0]
-            # Ground-truth post-action flags (only known for the action
-            # the agent actually took — counterfactual actions inherit).
+            # Ground-truth post-action state (col, row, has_key, door_open)
+            # for the action the agent took, taken verbatim from step t+1.
+            # None when terminal or unparseable. Counterfactual actions
+            # use the rule-based transition.
+            next_state_record = None
             if j + 1 < len(steps):
                 ns_step = steps[j + 1]
-                next_flags = (
-                    bool(ns_step.get("carrying_key", False)),
-                    bool(ns_step.get("door_open", False)),
-                )
-            else:
-                next_flags = None
+                ns_pos = parse_agent_pos(ns_step["grid_state"])
+                if ns_pos is not None:
+                    next_state_record = (
+                        ns_pos[0], ns_pos[1],
+                        bool(ns_step.get("carrying_key", False)),
+                        bool(ns_step.get("door_open", False)),
+                    )
             records.append({
                 "state": state, "phi": phi,
                 "agent_action": action, "opt_label": opt_label,
-                "opt_set": opt, "next_flags": next_flags,
+                "opt_set": opt, "next_state": next_state_record,
             })
     return records, dict(skipped), n_total
 
@@ -223,12 +261,16 @@ def build_phi_table(records):
     return {s: np.stack(phis).mean(axis=0) for s, phis in state_phis.items()}
 
 
-def build_dataset(records, phi_table, step):
+def build_dataset(records, phi_table, step_state):
     """Build the next-state-indexed training set.
 
-    For each record we compute f(s, a) for all 4 actions. If any next
-    state has no entry in phi_table the record is dropped (mirrors
-    cost_updated.ipynb).
+    Uses the full-state transition `step_state` (key pickup +
+    locked-door auto-open with key) for all 4 actions per record. For
+    the action the agent took, we override the rule-based flags with
+    the trajectory's recorded step-(t+1) flags — the rules can diverge
+    from reality in some Seed12 variants where the door cell is
+    rendered `_` rather than `D`. Counterfactual actions only have
+    the rule-based prediction.
     """
     state_list = sorted(phi_table.keys())
     s2i = {s: i for i, s in enumerate(state_list)}
@@ -241,21 +283,19 @@ def build_dataset(records, phi_table, step):
     next_idx, agent_labels, opt_labels, opt_sets = [], [], [], []
     dropped = 0
     for rec in records:
-        c, r, has_key, door_open = rec["state"]
+        cur = rec["state"]   # (col, row, has_key, door_open)
         rows, valid = [], True
-        # next_flags: ground-truth (carrying_key, door_open) at step t+1
-        # for the action the agent took. Used to label THE ACTUAL chosen
-        # action's next state correctly (e.g., key-pickup transitions).
-        # Counterfactual actions inherit the current flags (we have no
-        # ground truth for them).
-        nf = rec.get("next_flags")
+        nsr = rec.get("next_state")
         for a in ACTIONS:
-            nc, nr = step((c, r), a)
-            if a == rec["agent_action"] and nf is not None:
-                ns_has_key, ns_door_open = nf
+            if a == rec["agent_action"] and nsr is not None:
+                # Trust the trajectory verbatim — both position and
+                # flags come from step t+1. The rule-based step can
+                # diverge from the env (Seed12 `door_open` variants
+                # where the rule says "blocked" but the data shows
+                # the agent passing through).
+                ns = nsr
             else:
-                ns_has_key, ns_door_open = has_key, door_open
-            ns = (nc, nr, ns_has_key, ns_door_open)
+                ns = step_state(cur, a)
             if ns not in s2i:
                 valid = False; break
             rows.append(s2i[ns])
@@ -364,8 +404,9 @@ def eval_model(model, labels, phi_next, opt_sets, idx):
 def run_dataset(dataset_key, datasets):
     cfg = datasets[dataset_key]
     print(f"\n{'='*70}\n{cfg.name.upper()}\n{'='*70}")
-    H, W, walls, walkable, GOAL = parse_grid(cfg.traj_dir)
+    H, W, walls, walkable, GOAL, KEY, DOOR = parse_grid(cfg.traj_dir)
     step = make_step(walls, W, H, GOAL)
+    step_state = make_step_state(walls, W, H, GOAL, KEY, DOOR)
     dist, optimal_set = bfs_optimal(walkable, GOAL, step)
     print(f"Grid {W}x{H}, walkable={len(walkable)}, goal={GOAL}, "
           f"BFS-reached={len(dist)}/{len(walkable)}")
@@ -378,7 +419,7 @@ def run_dataset(dataset_key, datasets):
         records, drop_stats, n_total = collect_records(cfg, GOAL, optimal_set, token_pos)
         phi_table = build_phi_table(records)
         next_idx, agent_labels, opt_labels, opt_sets, phi_mat_norm, state_list, dropped = \
-            build_dataset(records, phi_table, step)
+            build_dataset(records, phi_table, step_state)
         N = len(agent_labels)
 
         # Materialise φ-of-next-state once: (N, 4, phi_dim)
