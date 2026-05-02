@@ -112,29 +112,162 @@ is a prerequisite for any meaningful intervention.
 
 ---
 
-## Direction 2 — Causal intervention via the belief direction *(already run on a prior dataset — null)*
+## Direction 2 — Causal intervention, redesigned
 
-**Question:** is the pre-reasoning belief *causally* responsible
-for the action, or just an epiphenomenal correlate of geometry?
+**Question:** is the layer-15 pre-reasoning state representation
+*causally* responsible for the agent's action — and if so, which
+*part* of it (the geometric cost gradient, the discrete `has_key`
+/ `door_open` flags, or the action-token preference at the output
+position)?
 
-**Status.** Run with the prior dataset
-(`results/causal_intervention_results.md`). **Null result**:
-belief-direction perturbation at layer-15 prompt-suffix didn't
-flip the action significantly more than a random direction of the
-same norm at any α ∈ {0, 0.5, 1, 2, 4, 8}. McNemar p > 0.05 at
-every α. The model's output prior dominated: some target actions
-were never reached regardless of steering direction (e.g.
-`belief=DOWN` flipped 0 / 23 cases).
+### What the prior run did, and why it was a null
 
-That run used a problematic dataset (mislabelled flags, only one
-variant per agent, position-only BFS labels). The current fourroom
-data is cleaner; a re-run is defensible.
+The first attempt
+(`results/causal_intervention_results.md`) constructed a steering
+vector from the per-action-heads probe — `v = α · (θ_â − θ_a*)`
+where `â` was the agent's wrong action and `a*` was an optimal
+action — and added it to the residual stream at layer 15, last 3
+prompt-suffix tokens. Across α ∈ {0, 0.5, 1, 2, 4, 8} on the
+prior dataset, belief-direction perturbations didn't flip the
+action more than a random direction of equal norm (McNemar
+p > 0.05 at every α). Some target actions were never reached
+regardless of steering direction.
 
-**Re-run on fourroom?** Same script with the new dataset and
-state-space BFS; budget is the same as the prior run. **Demote
-from "first" to "after Direction 1"** — without knowing where the
-belief gets lost, intervening at the prompt-suffix is shooting in
-the dark.
+The run had three problems that need addressing in a redesign:
+
+1. **Wrong probe form for the steering vector.** That probe used
+   per-action heads `θ_a` on the *current state*'s φ. The
+   canonical Cost-IRL formulation we now use is single-θ
+   next-state-averaged: `cost(s) = θᵀφ(s)`,
+   `P(a|s) = softmax(−β·cost(f(s, a)))`. Under that formulation
+   the "belief direction" isn't a per-action vector at all — it's
+   a single direction in φ-space whose dot product with φ
+   correlates with goal-distance.
+2. **Wrong state representation.** The optimal labels then were
+   position-only; the steering target was therefore noisy. With
+   state-space BFS the optimal action at `(s, F, F)` differs from
+   `(s, T, F)` differs from `(s, T, T)`, so the steering target
+   needs to be conditioned on the agent's full state.
+3. **Wrong intervention site (probably).** Pre-reasoning is
+   hundreds of tokens upstream of the action-emission point; CoT
+   re-derives the geometry from the unchanged input tokens. A
+   small rank-1 edit before the trace begins is easily drowned
+   out by the trace itself. The post-reasoning per-visit decoder
+   reads the action off the output positions at >90 % accuracy —
+   that's where the action lives.
+
+### Redesigned experiment — three sub-tests
+
+Each sub-test isolates a different candidate causal mediator.
+They are independent and can be run separately. Run on
+`fourroom_episode_sweep_T0` (all three variants).
+
+#### 2a. Variant-transplant intervention *(strongest test, naturalistic)*
+
+For each (col, row) cell visited under multiple variants, we have
+real activations under different `(has_key, door_open)`
+configurations from real trajectories. These activations differ
+*only* in the env's underlying state — same model, same
+prompt-template, same position.
+
+**Procedure.** At decision time on a `K0D0` agent at cell `(c, r)`,
+replace the layer-15 prompt-suffix activations with the
+corresponding `K1D1` activations at `(c, r)` (averaged across all
+`K1D1` visits to that cell, or sampled). Let the model continue.
+Does the `K0D0` agent now act like a `K1D1` agent — i.e., skip
+the key detour and head straight toward the door / goal?
+
+**Mirror.** Reverse direction: transplant `K0D0` activations into
+a `K1D1` agent's forward pass. Does the `K1D1` agent now detour
+to the key?
+
+**Why this is stronger than synthetic steering:**
+- We're injecting *real* activation patterns the network actually
+  produces, so we don't need to construct a probe-derived
+  direction. No question of "is this the right direction" — we
+  use what the network does on the other side.
+- Tests an inherently meaningful counterfactual: "if my world
+  state were different, would I act differently?".
+- The control is automatic: same-variant transplant (e.g.,
+  `K0D0` → `K0D0` from a different visit) should be a no-op.
+  Cross-variant transplant should differ.
+
+**What we learn.** Whether the layer-15 prompt-suffix activations
+*encoding the variant* are causally read out by the action
+selection. A positive result is direct evidence that the model's
+internal state belief drives action choice. A null result means
+the variant identity at this layer/position is a passive readout
+and the action is decided elsewhere (downstream layers, output
+positions, or in the reasoning trace).
+
+#### 2b. Late-position intervention at the action-emission token
+
+The previous run intervened at prompt-suffix (before the
+reasoning trace). The post-reasoning per-visit decoder finds the
+agent's emitted action at >90 % accuracy from the *output* token
+positions. So the action is decided *late*. Intervene there.
+
+**Procedure.** Identify the output-token position immediately
+before the action JSON value (`{"action": "X"}`'s `X`). At layer
+N (sweep over 7 / 15 / 23), add a steering vector. Two candidate
+vectors:
+- The unembedding direction of the optimal-action token minus
+  the agent's recorded-action token.
+- The cost-IRL θ direction (geometric goal direction in φ-space).
+
+Sweep α and a random control as before. Does the emitted action
+flip more than the prompt-suffix experiment showed?
+
+**What we learn.** Whether the residual stream at the late
+output positions *is* the action commitment, vs the action having
+been committed even earlier (in the reasoning text) and the output
+position is just transcribing. A clean positive at late positions
++ null at prompt-suffix narrows the commitment to the reasoning
+chain itself — which then makes Direction 1 (probe through the
+trace) the natural next step.
+
+#### 2c. Flag-direction steering (mechanistic, follows Direction 6)
+
+If Direction 6 finds that φ encodes `(has_key, door_open)` along
+linearly separable directions (call them `θ_key`, `θ_door`),
+then we have a clean mechanistic test: steer along `θ_key` to
+make a `K0D0` agent's residual stream "look like" `K1D0`. Does
+the agent's action change accordingly?
+
+**Procedure.** Train binary linear classifiers for `has_key` and
+`door_open` at layer 15. At runtime on a `K0D0` agent, add
+`α · θ_key` (the direction along which has_key=True is more
+likely under the classifier) to the residual stream at layer 15
+prompt-suffix.
+
+This is a *mechanism-decomposed* version of 2a: 2a transplants the
+whole activation pattern; 2c isolates the contribution of the
+`has_key` feature direction. If 2a flips the action but 2c
+doesn't, the flag is encoded but not the only causal mediator —
+something else (geometry, sub-goal pointer) is also load-bearing.
+
+### Cost
+
+- 2a (transplant): low. ~5 lines of nnsight to replace activations
+  at chosen positions. Re-uses already-extracted activations.
+  Runtime ~minutes per target trajectory.
+- 2b (late-position steering): low–moderate. Needs to identify
+  the output-action-token position per record (offset known from
+  the data); then standard hook-and-add.
+- 2c (flag-direction steering): trivial *after* Direction 6 runs.
+  Reuses the binary classifiers it trains.
+
+### Recommendation
+
+Run **2a first** — the transplant experiment is the most
+informative-per-dollar test, and a positive result would settle
+the causal question without further work. Direction 1 (probe
+through the trace) and 2b (late-position intervention) are
+complementary: if 2a is null and 2b is positive, that pins the
+commitment to the late stack at output positions and makes
+Direction 1 the obvious follow-up to localise *where in the
+trace* the geometric belief gets translated into the late-stack
+action representation.
 
 ---
 
@@ -299,22 +432,34 @@ the model represents sub-goals, the layer-23 shift might be
 ## Recommended order
 
 ```
-1  Probe through reasoning chain     ← localise where belief is lost
-└─ then  3  Layer-23 mechanism       ← what crowds out geometry
-└─ or    2  Causal intervention      ← only if Direction 1 reveals a localisable target
-
-6  Flags vs sub-goal              ← cheap mechanistic question, run anytime
-4  Failure prediction             ← independent, near-zero cost, run in parallel
-5  Reasoning-effort sweep         ← moderate cost, run last
+2a  Variant-transplant intervention   ← the redesigned causal test; cheap, naturalistic
+6   Flags vs sub-goal probe           ← parallel; cheap mechanistic question
+1   Probe through reasoning chain     ← if 2a is null, localise where belief is lost
+2b  Late-position intervention        ← follow-up if 1 shows late commitment
+3   Layer-23 mechanism                ← after 1 and 6 give context for what's at layer 23
+2c  Flag-direction steering           ← only if 6 gives clean linear flag directions
+4   Failure prediction                ← independent, near-zero cost, run in parallel
+5   Reasoning-effort sweep            ← moderate cost, run last
 ```
 
-**Direction 1 first.** With Direction 2 already null on the prior
-dataset, locating *where* the belief gets corrupted is the next
-informative thing. The intervention experiment makes most sense
-once we know the right place to intervene.
+**Direction 2a first.** The variant-transplant experiment is the
+single highest-leverage redesign of the original null result: it
+uses real activations (no synthesised steering vector), tests a
+cleanly-posed counterfactual ("if my world were different, would
+I act differently?"), and a positive result would settle the
+causal question. Cost is roughly the same as the prior
+intervention run but interpretable end-to-end.
 
 **Direction 6 in parallel.** ~50 lines of code on data already on
-disk; resolves a cleanly-posed mechanistic question.
+disk; resolves a clean mechanistic question and feeds into 2c.
+
+**Direction 1 next** if 2a is null — localising *where* the
+belief gets corrupted is the next informative thing.
+
+**Direction 2b** as the natural follow-up to 1: if Direction 1
+shows belief surviving most of the trace and only collapsing at
+the output, late-position steering is the right place to test
+direct causal effect.
 
 **Direction 4 in parallel** for the practical-payoff thread.
 
