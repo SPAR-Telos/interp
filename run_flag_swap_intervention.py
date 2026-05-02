@@ -106,11 +106,18 @@ def get_layer_module(model, layer_idx):
 
 
 def run_condition(model, tokenizer, layer_module, prompt_row, donor, n_samples,
-                  temperature, max_new_tokens, device, smoke_input_ids=None):
+                  temperature, max_new_tokens, device, smoke_input_ids=None,
+                  batch_size=None):
     """Run one condition: prompt + (optional) hook + N sampled generations.
 
-    Returns: list of {action, text_tail, log} dicts (length n_samples) and
-    the first-sample hook log (single dict).
+    Splits N samples into chunks of ``batch_size`` (defaults to N — one
+    big batch). Each chunk is one `generate()` call; the hook fires once
+    per chunk during prompt processing. Smaller batches reduce peak GPU
+    memory at the cost of repeated prompt-processing forward passes.
+
+    Returns: list of {action, text_tail} dicts (length n_samples) and
+    the merged hook log from the FIRST chunk (subsequent chunks just
+    re-fire the same hook).
     """
     if smoke_input_ids is not None:
         input_ids = smoke_input_ids.to(device)
@@ -118,29 +125,48 @@ def run_condition(model, tokenizer, layer_module, prompt_row, donor, n_samples,
         input_ids = torch.tensor([prompt_row["full_token_ids"]], dtype=torch.long, device=device)
     positions = prompt_row["suffix_positions"]
 
-    log = {}
-    handle = layer_module.register_forward_hook(
-        make_replace_hook(positions, donor, log=log)
-    )
-    try:
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                num_return_sequences=n_samples,
-                pad_token_id=tokenizer.eos_token_id or 0,
-                use_cache=True,
-            )
-    finally:
-        handle.remove()
+    if batch_size is None or batch_size <= 0:
+        batch_size = n_samples
 
-    out = []
-    for k in range(output_ids.shape[0]):
-        new_token_ids = output_ids[k, input_ids.shape[1]:]
-        text = tokenizer.decode(new_token_ids, skip_special_tokens=False)
-        out.append({"action": parse_action(text), "text_tail": text[-300:]})
+    out: list[dict] = []
+    log: dict = {}
+    n_remaining = n_samples
+    chunk_idx = 0
+    while n_remaining > 0:
+        this_batch = min(batch_size, n_remaining)
+        chunk_log: dict = {}
+        handle = layer_module.register_forward_hook(
+            make_replace_hook(positions, donor, log=chunk_log)
+        )
+        try:
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    num_return_sequences=this_batch,
+                    pad_token_id=tokenizer.eos_token_id or 0,
+                    use_cache=True,
+                )
+        finally:
+            handle.remove()
+
+        for k in range(output_ids.shape[0]):
+            new_token_ids = output_ids[k, input_ids.shape[1]:]
+            text = tokenizer.decode(new_token_ids, skip_special_tokens=False)
+            out.append({"action": parse_action(text), "text_tail": text[-300:]})
+
+        if chunk_idx == 0:
+            log = chunk_log
+            log["n_chunks"] = (n_samples + batch_size - 1) // batch_size
+            log["batch_size_per_chunk"] = batch_size
+        del output_ids
+        n_remaining -= this_batch
+        chunk_idx += 1
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     return out, log
 
 
@@ -156,6 +182,11 @@ def main():
     ap.add_argument("--layer", type=int, default=15)
     ap.add_argument("--n-samples", type=int, default=30,
                     help="N samples per condition. Smoke default is 4.")
+    ap.add_argument("--batch-size", type=int, default=0,
+                    help="Samples per generate() call. 0 = one big batch "
+                         "of n_samples. Reduce if OOM (e.g. 4 or 8 if "
+                         "the model is dequantised to bf16 and leaves "
+                         "little headroom on an 80GB H100).")
     ap.add_argument("--temperature", type=float, default=0.7,
                     help="Sampling temperature. Project rule: T=0.7, never 0.")
     ap.add_argument("--max-new-tokens", type=int, default=1024)
@@ -248,15 +279,29 @@ def main():
 
     n_written = 0
     with open(args.output, "w") as fout:
-        for cond_name, prompt_row, donor in conditions:
-            print(f"\n=== {cond_name} (N={n_samples}) ===")
+        for cond_idx, (cond_name, prompt_row, donor) in enumerate(conditions):
+            bs_str = f"chunked (B={args.batch_size})" if args.batch_size > 0 else "single batch"
+            print(f"\n=== {cond_name} (N={n_samples}, {bs_str}) ===")
             try:
                 samples, log = run_condition(
                     model, tokenizer, layer_module, prompt_row, donor,
                     n_samples=n_samples, temperature=args.temperature,
                     max_new_tokens=max_new_tokens, device=device,
                     smoke_input_ids=smoke_inputs.get(prompt_row["label"]),
+                    batch_size=args.batch_size if args.batch_size > 0 else None,
                 )
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"  CUDA OOM: {e}", file=sys.stderr)
+                if cond_idx == 0:
+                    raise SystemExit(
+                        "First condition OOM'd. Aborting before writing 180 "
+                        "rows of None. Re-run with --batch-size 4 (or smaller) "
+                        "or install MXFP4 deps:\n"
+                        "    uv pip install 'triton>=3.4.0' kernels"
+                    )
+                samples = [{"action": None, "text_tail": "", "error": "OOM"}
+                           for _ in range(n_samples)]
+                log = {"error": "OOM"}
             except Exception as e:
                 print(f"  ERROR: {e}", file=sys.stderr)
                 traceback.print_exc()
