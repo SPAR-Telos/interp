@@ -2,17 +2,30 @@
 activation tensors for the flag-swap experiment (Direction 2c,
 clean activation patch on the carrying_key flag).
 
+**Symmetric-K version**: both prompts always show the K cell on the
+grid, regardless of whether the agent is carrying the key. The only
+textual difference between prompt a and prompt b is the
+`Carrying key: False` vs `Carrying key: True` line in the suffix.
+This isolates the causal test to the explicit flag text — the
+grid-rendering confound from the previous (asymmetric) run is
+removed.
+
 Picks one K0D0 visit and one K1D0 visit at cell (1, 5) — the cell
 directly below the locked door at (1, 4). The K0D0 visit has the
 agent without the key (BFS-optimal: head back for the key); the
 K1D0 visit has the agent holding the key (BFS-optimal: UP through
-the door, which auto-opens).
+the door, which auto-opens). Prompt b's grid tokens are overridden
+with K0D0's grid tokens, so the K cell stays visible in prompt b.
 
 Outputs:
   flag_swap/prompts.jsonl   — two rows: a (K0D0) and b (K1D0)
   flag_swap/act_a.pt        — (3, 2880) bfloat16: layer-15 last 3
                               prompt-suffix activations from prompt a
-  flag_swap/act_b.pt        — same, from prompt b
+  flag_swap/act_b.pt        — saved tensor reflects the *original*
+                              K1D0 prompt; the MLX runner re-captures
+                              activations live from the symmetric
+                              prompt, so this file is only kept for
+                              record-keeping.
 
 Mac CPU only.
 """
@@ -85,13 +98,21 @@ def find_visit(traj_dir: Path, target_variant: str, target_cell: tuple[int, int]
 
 
 def build_prompt_row(label: str, variant: str, traj_stem: str, step_id: int,
-                     agent_action: str, tj: dict) -> dict:
+                     agent_action: str, tj: dict,
+                     grid_tokens_override: list | None = None,
+                     grid_source_note: str | None = None) -> dict:
+    # Trajectory-level prefix is static template text (no flag placeholders).
     prefix_tokens = tj["prompt"]["prompt_prefix_tokens"]
-    suffix_tokens = tj["prompt"]["prompt_suffix_tokens"]
     n_prefix = len(prefix_tokens)
-    n_suffix = len(suffix_tokens)
+    # IMPORTANT: use the STEP-RENDERED suffix (`Carrying key: True/False`),
+    # not the trajectory-level template suffix (which contains literal
+    # `{{carrying_key}}` placeholders). The previous run accidentally used
+    # the template — both prompts had `Ġ{{carrying_key}}` and the only
+    # K0D0-vs-K1D0 signal was the K-cell rendering in the grid.
     s = next(s for s in tj["steps"] if s["step_id"] == step_id)
-    grid_tokens = s["grid_state_tokens"]
+    suffix_tokens = s["prompt_suffix_tokens"]
+    n_suffix = len(suffix_tokens)
+    grid_tokens = grid_tokens_override if grid_tokens_override is not None else s["grid_state_tokens"]
     n_grid = len(grid_tokens)
     full_token_ids = (
         [t["token_id"] for t in prefix_tokens]
@@ -114,6 +135,7 @@ def build_prompt_row(label: str, variant: str, traj_stem: str, step_id: int,
         "prompt_len": prompt_len,
         "suffix_positions": suffix_positions,
         "full_token_ids": full_token_ids,
+        "grid_source": grid_source_note or f"{traj_stem}/step_{step_id}",
     }
 
 
@@ -173,8 +195,21 @@ def main():
     print(f"  prompt a (K0D0): {a_stem} step {a_step}  recorded action = {a_action}")
     print(f"  prompt b (K1D0): {b_stem} step {b_step}  recorded action = {b_action}")
 
+    # Symmetric grid: override prompt b's grid_state_tokens with prompt a's
+    # so the K cell is always visible. The remaining textual difference
+    # between the two prompts is the `Carrying key: True/False` token in
+    # the suffix — which is the variable we want to test causally.
+    a_step_obj = next(s for s in a_tj["steps"] if s["step_id"] == a_step)
+    a_grid_tokens = a_step_obj["grid_state_tokens"]
+    print(f"  symmetric-grid override: prompt b grid_state_tokens "
+          f"<-- {a_stem}/step_{a_step} ({len(a_grid_tokens)} tokens)")
+
     row_a = build_prompt_row("a", "K0D0", a_stem, a_step, a_action, a_tj)
-    row_b = build_prompt_row("b", "K1D0", b_stem, b_step, b_action, b_tj)
+    row_b = build_prompt_row(
+        "b", "K1D0", b_stem, b_step, b_action, b_tj,
+        grid_tokens_override=a_grid_tokens,
+        grid_source_note=f"{a_stem}/step_{a_step} (symmetric override; always shows K)",
+    )
 
     print("\nPrompt diff (decoded-text-free; token-level):")
     print(diff_suffix_text(row_a, row_b))
@@ -195,7 +230,8 @@ def main():
     # Distance between act_a and act_b
     diff = (act_a.float() - act_b.float()).norm(dim=-1)
     print(f"||act_a − act_b|| per token = {[round(d.item(), 2) for d in diff]}  "
-          f"(non-zero ⇒ activations carry the variant signal)")
+          f"(NOTE: disk-loaded act_b is from the *original* K1D0 prompt — "
+          f"the MLX runner re-captures activations live from the symmetric prompt.)")
 
     # Save
     prompts_path = args.out_dir / "prompts.jsonl"
