@@ -133,37 +133,64 @@ def make_step_state(walls, W, H, GOAL, KEY, DOOR):
             return state
         if (nc, nr) in walls:
             return state
+        # Locked door blocks unless the agent has the key (auto-opens).
+        new_door_open = door_open
+        if DOOR is not None and (nc, nr) == DOOR and not door_open:
+            if not has_key:
+                return state
+            new_door_open = True
         new_has_key = has_key
         if KEY is not None and (nc, nr) == KEY and not has_key:
             new_has_key = True
-        new_door_open = door_open
-        if not door_open and DOOR is not None and (nc, nr) == DOOR and has_key:
-            new_door_open = True
         return (nc, nr, new_has_key, new_door_open)
     return f
 
 
-def bfs_optimal(walkable, GOAL, step):
-    dist = {GOAL: 0}
-    q = deque([GOAL])
+def bfs_optimal(walkable, GOAL, step_state):
+    """BFS in the full ``(col, row, has_key, door_open)`` state space.
+
+    Distances respect the env dynamics encoded in ``step_state``: an
+    agent without the key on the wrong side of a locked door must
+    detour through the key cell first, so its distance to the goal is
+    larger than the same position with the key already collected.
+    Position-only BFS would mistakenly give them the same distance.
+    """
+    states = []
+    for (c, r) in walkable:
+        for has_key in (False, True):
+            for door_open in (False, True):
+                states.append((c, r, has_key, door_open))
+
+    incoming = defaultdict(list)
+    for s in states:
+        for a in ACTIONS:
+            ns = step_state(s, a)
+            if ns != s:
+                incoming[ns].append(s)
+
+    dist = {}
+    q = deque()
+    for s in states:
+        if (s[0], s[1]) == GOAL:
+            dist[s] = 0
+            q.append(s)
     while q:
         cur = q.popleft()
-        c, r = cur
-        for dc, dr in DELTAS.values():
-            nxt = (c + dc, r + dr)
-            if nxt in walkable and nxt not in dist:
-                dist[nxt] = dist[cur] + 1
-                q.append(nxt)
+        for s in incoming[cur]:
+            if s not in dist:
+                dist[s] = dist[cur] + 1
+                q.append(s)
+
     optimal_set = {}
-    for pos in walkable:
-        if pos == GOAL or pos not in dist:
+    for s in states:
+        if (s[0], s[1]) == GOAL or s not in dist:
             continue
         best = []
         for a in ACTIONS:
-            nxt = step(pos, a)
-            if nxt != pos and dist.get(nxt) == dist[pos] - 1:
+            ns = step_state(s, a)
+            if ns != s and dist.get(ns) == dist[s] - 1:
                 best.append(a)
-        optimal_set[pos] = best
+        optimal_set[s] = best
     return dist, optimal_set
 
 
@@ -194,17 +221,10 @@ def load_activation(act_dir, traj_stem, step_id, token_pos):
 def collect_records(cfg, GOAL, optimal_set, token_pos):
     """Walk trajectories. Each (traj, step_id) becomes one record.
 
-    state = (col, row, carrying_key, door_open). The flags are read
-    verbatim from each trajectory step — they are NOT constant across
-    Seed12 (carrying_key flips True in 12/79 trajectories once the
-    agent walks onto the key cell) and they are NOT constant across
-    two_path (door_open is uniformly True there but carrying_key flips
-    in some trajectories too if the dataset has them).
-
-    We also stash the *next step's* flags under "next_flags": for the
-    action the agent actually took, those are the ground-truth
-    post-action flags read off the trajectory rather than carried over
-    from the current state. None when the current step is terminal.
+    state = (col, row, carrying_key, door_open), read verbatim from
+    each trajectory step. The optimal-action set comes from BFS in the
+    full state space (`optimal_set` is keyed by the 4-tuple, not by
+    position).
     """
     records = []
     skipped = Counter()
@@ -213,8 +233,7 @@ def collect_records(cfg, GOAL, optimal_set, token_pos):
         with open(tp) as f:
             tj = json.load(f)
         stem = tp.stem
-        steps = tj["steps"]
-        for j, s in enumerate(steps):
+        for s in tj["steps"]:
             n_total += 1
             action = s.get("agent_action")
             if action not in A2I:
@@ -224,34 +243,20 @@ def collect_records(cfg, GOAL, optimal_set, token_pos):
                 skipped["no_pos"] += 1; continue
             if pos == GOAL:
                 skipped["at_goal"] += 1; continue
-            if pos not in optimal_set or not optimal_set[pos]:
+            has_key = bool(s.get("carrying_key", False))
+            door_open = bool(s.get("door_open", False))
+            state = (pos[0], pos[1], has_key, door_open)
+            if state not in optimal_set or not optimal_set[state]:
                 skipped["no_optimal"] += 1; continue
             phi = load_activation(cfg.act_dir, stem, s["step_id"], token_pos)
             if phi is None:
                 skipped["no_phi"] += 1; continue
-            has_key = bool(s.get("carrying_key", False))
-            door_open = bool(s.get("door_open", False))
-            state = (pos[0], pos[1], has_key, door_open)
-            opt = optimal_set[pos]
+            opt = optimal_set[state]
             opt_label = action if action in opt else opt[0]
-            # Ground-truth post-action state (col, row, has_key, door_open)
-            # for the action the agent took, taken verbatim from step t+1.
-            # None when terminal or unparseable. Counterfactual actions
-            # use the rule-based transition.
-            next_state_record = None
-            if j + 1 < len(steps):
-                ns_step = steps[j + 1]
-                ns_pos = parse_agent_pos(ns_step["grid_state"])
-                if ns_pos is not None:
-                    next_state_record = (
-                        ns_pos[0], ns_pos[1],
-                        bool(ns_step.get("carrying_key", False)),
-                        bool(ns_step.get("door_open", False)),
-                    )
             records.append({
                 "state": state, "phi": phi,
                 "agent_action": action, "opt_label": opt_label,
-                "opt_set": opt, "next_state": next_state_record,
+                "opt_set": opt,
             })
     return records, dict(skipped), n_total
 
@@ -288,17 +293,8 @@ def build_dataset(records, phi_table, step_state):
     for rec in records:
         cur = rec["state"]   # (col, row, has_key, door_open)
         rows, valid = [], True
-        nsr = rec.get("next_state")
         for a in ACTIONS:
-            if a == rec["agent_action"] and nsr is not None:
-                # Trust the trajectory verbatim — both position and
-                # flags come from step t+1. The rule-based step can
-                # diverge from the env (Seed12 `door_open` variants
-                # where the rule says "blocked" but the data shows
-                # the agent passing through).
-                ns = nsr
-            else:
-                ns = step_state(cur, a)
+            ns = step_state(cur, a)
             if ns not in s2i:
                 valid = False; break
             rows.append(s2i[ns])
@@ -410,7 +406,7 @@ def run_dataset(dataset_key, datasets):
     H, W, walls, walkable, GOAL, KEY, DOOR = parse_grid(cfg.traj_dir)
     step = make_step(walls, W, H, GOAL)
     step_state = make_step_state(walls, W, H, GOAL, KEY, DOOR)
-    dist, optimal_set = bfs_optimal(walkable, GOAL, step)
+    dist, optimal_set = bfs_optimal(walkable, GOAL, step_state)
     print(f"Grid {W}x{H}, walkable={len(walkable)}, goal={GOAL}, "
           f"BFS-reached={len(dist)}/{len(walkable)}")
 
