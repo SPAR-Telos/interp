@@ -136,7 +136,10 @@ def make_step_state(walls, W, H, GOAL, KEY, DOOR):
         new_has_key = has_key
         if KEY is not None and (nc, nr) == KEY and not has_key:
             new_has_key = True
-        return (nc, nr, new_has_key, door_open)
+        new_door_open = door_open
+        if not door_open and DOOR is not None and (nc, nr) == DOOR and has_key:
+            new_door_open = True
+        return (nc, nr, new_has_key, new_door_open)
     return f
 
 
