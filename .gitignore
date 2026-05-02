@@ -11,6 +11,8 @@ __pycache__/
 *.so
 
 **/*.pt
+# ...except small experiment artifacts that ship with the branch:
+!transplant_intervention/donors.pt
 
 # Distribution / packaging
 .Python
