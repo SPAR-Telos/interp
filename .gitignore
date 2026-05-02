@@ -11,6 +11,9 @@ __pycache__/
 *.so
 
 **/*.pt
+# ...except small experiment artifacts that ship with the branch:
+!flag_swap/act_a.pt
+!flag_swap/act_b.pt
 
 # Distribution / packaging
 .Python
