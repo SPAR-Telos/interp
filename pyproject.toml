@@ -18,6 +18,8 @@ dependencies = [
     "tyro>=1.0.5",
     "pandas>=2.3.3",
     "nnterp>=1.2.2",
+    "mlx>=0.30.3",
+    "mlx-lm>=0.29.1",
 ]
 
 [project.optional-dependencies]
