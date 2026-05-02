@@ -7,18 +7,18 @@ Two `LinearCostIRL` models trained on identical Seed12 activations
 
 | metric                          | Model A (label = agent action) | Model B (label = optimal action) |
 |---------------------------------|-------------------------------:|---------------------------------:|
-| **test accuracy**               |                      **0.376** |                        **0.941** |
-| test set-membership accuracy¹   |                          0.472 |                        **0.993** |
-| test log-likelihood             |                        −1.2069 |                          −0.2429 |
-| train accuracy                  |                          0.426 |                            0.933 |
+| **test accuracy**               |                      **0.416** |                        **0.941** |
+| test set-membership accuracy¹   |                          0.429 |                        **0.993** |
+| test log-likelihood             |                        −1.2080 |                          −0.2424 |
+| train accuracy                  |                          0.438 |                            0.933 |
 | majority-class baseline         |                          0.412 |                            0.418 |
 | random baseline                 |                          0.250 |                            0.250 |
 
 ¹ *Predicted action ∈ BFS-optimal set (gives credit when several actions are tied for optimal).*
 
 **The activations predict the BFS-optimal action with 94.1 % accuracy
-(99.3 % set-membership) but predict the agent's actual action only 37.6 %
-of the time — at the 41.2 % majority-class baseline.**
+(99.3 % set-membership) but predict the agent's actual action only 41.6 %
+of the time — barely above the 41.2 % majority-class baseline.**
 
 ---
 
@@ -113,10 +113,17 @@ P(a | s; θ) = softmax_a (−β · C_θ(f(s, a)))
 
 with β = 1. `f(s, a)` is the deterministic transition: walls and
 out-of-bounds cells are blocking, the door cell is walkable from the
-start, the goal is a no-op. The key/door flags are inherited from the
-current state (the script does not model the key-pickup or door-open
-dynamics — both datasets in this report have flags constant within
-each trajectory).
+start, the goal is a no-op.
+
+For the next state's `(carrying_key, door_open)` flags we use the
+trajectory's actual step-`t+1` record when `a` is the action the agent
+took — so a key-pickup transition produces a next state with
+`carrying_key=True`, looked up in the φ-table at the post-pickup
+state. For the 3 counterfactual actions per record we have no recorded
+ground truth, so we inherit the current state's flags as a fallback.
+This affects only the 12 key-pickup transitions in Seed12 (and any
+similar transitions in other datasets); without the fix those 12
+records would look up the wrong post-pickup φ.
 
 The crucial property — **and the key difference from a per-visit
 multinomial logistic regression** — is that the model scores each
@@ -313,7 +320,7 @@ membership.
 
 ### Bottom line on leakage
 
-The qualitative finding (Model B at 94 % accuracy, Model A at ~38 %
+The qualitative finding (Model B at 94 % accuracy, Model A at ~42 %
 near majority baseline) is robust to all three issues:
 
 - Issue (1) provides identical feature-side advantage to both models →
@@ -322,7 +329,7 @@ near majority baseline) is robust to all three issues:
   (linear separability of optimal action from φ) and is again identical
   for both models.
 - Issue (3) inflates both models' test numbers by at most a couple of
-  percentage points; the gap between 38 % and 94 % is ~56 pp, far
+  percentage points; the gap between 42 % and 94 % is ~52 pp, far
   larger than any plausible inflation.
 
 The leakage caveats apply to interpreting **absolute** numbers, not to
@@ -336,9 +343,9 @@ the **comparison**.
 
 | action | accuracy | n  |
 |-------:|---------:|---:|
-| LEFT   |    0.583 | 60 |
-| RIGHT  |    0.284 | 67 |
-| UP     |    0.394 | 127|
+| LEFT   |    0.500 | 60 |
+| RIGHT  |    0.418 | 67 |
+| UP     |    0.457 | 127|
 | DOWN   |    0.204 | 49 |
 
 **Model B** (label = optimal action):
@@ -369,14 +376,14 @@ visually in the upper portion of the rendered grid.
 
 | model trained on   | scored against | acc   | in-opt-acc | log-lik |
 |-------------------:|---------------:|------:|-----------:|--------:|
-| **agent labels (A)**   | optimal labels | 0.422 | **0.472**  | −1.4336 |
-| **optimal labels (B)** | agent labels   | 0.360 | **0.993**  | −3.4352 |
+| **agent labels (A)**   | optimal labels | 0.386 | **0.429**  | −1.4317 |
+| **optimal labels (B)** | agent labels   | 0.360 | **0.993**  | −3.4326 |
 
 - **Model B picks an optimal action 99.3 % of the time on test**, even
   scored against the agent's labels — almost every prediction it makes
   is geometrically correct, it just disagrees with what the agent did.
-- **Model A picks an optimal action only 47 % of the time** — close to
-  the raw rate at which the agent itself is optimal (43 %).
+- **Model A picks an optimal action only 43 % of the time** — at the
+  raw rate at which the agent itself is optimal (43 %).
 
 ---
 
@@ -395,7 +402,7 @@ visited state. Conditioning on φ(s), the agent's action distribution is
 close to **state-independent random**, dominated by an UP-bias that
 doesn't correspond to the goal direction. A linear cost on φ(s) cannot
 do much better than the majority-class baseline (0.412) — and indeed it
-lands at 0.376.
+lands at 0.416.
 
 ### What this says about layer-15 activations
 The activations encode **where the goal is**, not **what the agent will
@@ -435,34 +442,34 @@ single scalar cost output, scored over the 4 next states.
 
 |                          |  linear / pre  |  linear / post  |   MLP / pre   |   MLP / post   |
 |-------------------------:|:-------------:|:---------------:|:-------------:|:--------------:|
-| **Model A (agent)**      |     0.376     |      0.376      |     0.376     |     0.347      |
-| **Model B (optimal)**    |   **0.941**   |    **0.908**    |   **0.931**   |   **0.931**    |
-| gap (B − A)              |    +0.565     |     +0.532      |    +0.555     |    +0.584      |
+| **Model A (agent)**      |     0.416     |      0.413      |     0.416     |     0.413      |
+| **Model B (optimal)**    |   **0.941**   |    **0.921**    |   **0.931**   |   **0.927**    |
+| gap (B − A)              |    +0.525     |     +0.508      |    +0.515     |    +0.515      |
 
 ### Test set-membership accuracy (predicted action ∈ optimal set)
 
 |                          |  linear / pre  |  linear / post  |   MLP / pre   |   MLP / post   |
 |-------------------------:|:-------------:|:---------------:|:-------------:|:--------------:|
-| Model A (agent)          |     0.472     |      0.469      |     0.472     |     0.353      |
-| **Model B (optimal)**    |   **0.993**   |    **0.970**    |   **0.993**   |   **0.997**    |
+| Model A (agent)          |     0.429     |      0.429      |     0.429     |     0.429      |
+| **Model B (optimal)**    |   **0.993**   |    **0.970**    |   **0.993**   |   **0.993**    |
 
 ### Test log-likelihood
 
 |                          |  linear / pre  |  linear / post  |   MLP / pre   |   MLP / post   |
 |-------------------------:|:-------------:|:---------------:|:-------------:|:--------------:|
-| Model A (agent)          |    −1.2069    |     −1.2037     |    −1.2033    |    −1.2053     |
-| Model B (optimal)        |    −0.2429    |     −0.2448     |    −0.2546    |    −0.2303     |
+| Model A (agent)          |    −1.2080    |     −1.2108     |    −1.2023    |    −1.2065     |
+| Model B (optimal)        |    −0.2424    |     −0.2511     |    −0.2475    |    −0.2087     |
 
 ### Findings from the extension
 
 **(a) MLP is essentially tied with linear.** Across all four (token × label)
-slots the MLP changes test accuracy by at most ~3 pp. This matches the
+slots the MLP changes test accuracy by at most ~1 pp. This matches the
 finding from `cost_updated.ipynb` (linear and MLP both hit 61.3 % on the
 fixed-key-door dataset). Layer-15 activations already linearise
 distance-to-goal — the extra capacity has nothing useful to do.
 
 **(b) Pre vs post is also nearly tied.** Pre-reasoning φ is a hair better
-on Model B linear (0.941 vs 0.908 post, +3.3 pp), suggesting that the
+on Model B linear (0.941 vs 0.921 post, +2.0 pp), suggesting that the
 geometric information is already present in the residual stream *before*
 the model emits any tokens for that step. This is a property of the
 **averaged** φ — once visits are averaged, the per-visit "policy
@@ -471,7 +478,7 @@ visit-invariant (geometric) information. See the per-visit decoder
 results in `belief_action_gap.md` for what post-reasoning φ encodes
 without averaging.
 
-**(c) The headline gap is robust.** Model B beats Model A by 53–58 pp
+**(c) The headline gap is robust.** Model B beats Model A by 51–53 pp
 test accuracy in every (head × token) combination. The qualitative
 finding — *activations encode the optimal direction much more cleanly
 than the agent's actual choice* — does not depend on the model class or

@@ -157,10 +157,17 @@ def load_activation(act_dir, traj_stem, step_id, token_pos):
 def collect_records(cfg, GOAL, optimal_set, token_pos):
     """Walk trajectories. Each (traj, step_id) becomes one record.
 
-    state = (col, row, carrying_key, door_open). For Seed12 / two_path
-    these flags are constant across each dataset, so state effectively
-    reduces to (col, row), but we keep the full tuple for parity with
-    cost_updated.ipynb.
+    state = (col, row, carrying_key, door_open). The flags are read
+    verbatim from each trajectory step — they are NOT constant across
+    Seed12 (carrying_key flips True in 12/79 trajectories once the
+    agent walks onto the key cell) and they are NOT constant across
+    two_path (door_open is uniformly True there but carrying_key flips
+    in some trajectories too if the dataset has them).
+
+    We also stash the *next step's* flags under "next_flags": for the
+    action the agent actually took, those are the ground-truth
+    post-action flags read off the trajectory rather than carried over
+    from the current state. None when the current step is terminal.
     """
     records = []
     skipped = Counter()
@@ -169,7 +176,8 @@ def collect_records(cfg, GOAL, optimal_set, token_pos):
         with open(tp) as f:
             tj = json.load(f)
         stem = tp.stem
-        for s in tj["steps"]:
+        steps = tj["steps"]
+        for j, s in enumerate(steps):
             n_total += 1
             action = s.get("agent_action")
             if action not in A2I:
@@ -189,10 +197,20 @@ def collect_records(cfg, GOAL, optimal_set, token_pos):
             state = (pos[0], pos[1], has_key, door_open)
             opt = optimal_set[pos]
             opt_label = action if action in opt else opt[0]
+            # Ground-truth post-action flags (only known for the action
+            # the agent actually took — counterfactual actions inherit).
+            if j + 1 < len(steps):
+                ns_step = steps[j + 1]
+                next_flags = (
+                    bool(ns_step.get("carrying_key", False)),
+                    bool(ns_step.get("door_open", False)),
+                )
+            else:
+                next_flags = None
             records.append({
                 "state": state, "phi": phi,
                 "agent_action": action, "opt_label": opt_label,
-                "opt_set": opt,
+                "opt_set": opt, "next_flags": next_flags,
             })
     return records, dict(skipped), n_total
 
@@ -225,9 +243,19 @@ def build_dataset(records, phi_table, step):
     for rec in records:
         c, r, has_key, door_open = rec["state"]
         rows, valid = [], True
+        # next_flags: ground-truth (carrying_key, door_open) at step t+1
+        # for the action the agent took. Used to label THE ACTUAL chosen
+        # action's next state correctly (e.g., key-pickup transitions).
+        # Counterfactual actions inherit the current flags (we have no
+        # ground truth for them).
+        nf = rec.get("next_flags")
         for a in ACTIONS:
             nc, nr = step((c, r), a)
-            ns = (nc, nr, has_key, door_open)   # flags constant in our datasets
+            if a == rec["agent_action"] and nf is not None:
+                ns_has_key, ns_door_open = nf
+            else:
+                ns_has_key, ns_door_open = has_key, door_open
+            ns = (nc, nr, ns_has_key, ns_door_open)
             if ns not in s2i:
                 valid = False; break
             rows.append(s2i[ns])
