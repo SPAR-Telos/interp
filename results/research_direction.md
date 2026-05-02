@@ -122,16 +122,16 @@ position)?
 
 ### What the prior run did, and why it was a null
 
-The first attempt
-(`results/causal_intervention_results.md`) constructed a steering
-vector from the per-action-heads probe — `v = α · (θ_â − θ_a*)`
-where `â` was the agent's wrong action and `a*` was an optimal
-action — and added it to the residual stream at layer 15, last 3
-prompt-suffix tokens. Across α ∈ {0, 0.5, 1, 2, 4, 8} on the
-prior dataset, belief-direction perturbations didn't flip the
-action more than a random direction of equal norm (McNemar
-p > 0.05 at every α). Some target actions were never reached
-regardless of steering direction.
+The first attempt (run on a now-deleted branch) constructed a
+steering vector from a per-action-heads probe —
+`v = α · (θ_â − θ_a*)` where `â` was the agent's wrong action
+and `a*` was an optimal action — and added it to the residual
+stream at layer 15, last 3 prompt-suffix tokens. Across
+α ∈ {0, 0.5, 1, 2, 4, 8} on the prior dataset,
+belief-direction perturbations didn't flip the action more than a
+random direction of equal norm (McNemar p > 0.05 at every α).
+Some target actions were never reached regardless of steering
+direction.
 
 The run had three problems that need addressing in a redesign:
 
@@ -475,8 +475,6 @@ qualitative shape of Direction 1's result.
   — main report on the current dataset
 - `results/two_path_no_key_T0_agent_vs_optimal_extended.{json,pkl}`
   — companion easy-task data
-- `results/causal_intervention_results.md` — Direction 2 (null
-  result, prior dataset)
 - `run_agent_vs_optimal_extended.py` — the cost-IRL pipeline
   (state-space BFS + auto-open transition)
 - `run_belief_action_gap.py`, `run_belief_action_gap_layers.py` —
