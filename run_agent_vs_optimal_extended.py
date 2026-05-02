@@ -2,24 +2,21 @@
 
 Algorithm (next-state averaged-φ form, ported from `cost_updated.ipynb`):
 
-  - φ(s) = mean of activations across all visits to state s (one φ per state)
+  - φ(s) = mean of activations across all visits to state s (one φ per state),
+    state = (col, row, carrying_key, door_open)
   - Single θ ∈ ℝ^{phi_dim};  cost(s) = θᵀ · φ(s)
   - Policy:  P(a | s) = softmax(−β · cost(f(s, a)))
-  - For each (s_t, a_t) transition we look up φ(f(s, a)) for all 4 actions;
+  - The transition f(s, a) handles walls/bounds, key pickup on contact,
+    and locked-door auto-open with the key. BFS for optimal-action
+    labels is over the full state space, so without the key the agent
+    must detour via the key cell before passing the door.
+  - For each (s_t, a_t) we look up φ(f(s, a)) for all 4 actions;
     transitions whose next state was never observed are dropped.
 
 Runs 8 configurations per dataset:
   model_type ∈ {linear, mlp}  ×  token ∈ {pre, post}  ×  label ∈ {agent, optimal}
 
 Outputs `<dataset>_agent_vs_optimal_extended.{pkl,json}` under results/.
-
-Datasets:
-  - Seed12               (data/trajectories/Seed12)
-  - two_path_no_key_T0   (data/trajectories/two_path_no_key_T0)
-
-Both datasets have constant (carrying_key, door_open) across all steps,
-so the transition function is plain 4-direction movement that stops at
-walls and the goal.
 """
 from __future__ import annotations
 import argparse
@@ -53,19 +50,19 @@ class DatasetCfg:
 
 
 DATASETS = {
-    "seed12": DatasetCfg(
-        name="seed12",
-        traj_dir=Path("/Users/wws/interp/data/trajectories/Seed12"),
-        act_dir=Path("/Users/wws/interp/data/activations/Seed12"),
-        out_pkl=Path("/Users/wws/interp/results/seed12_agent_vs_optimal_extended.pkl"),
-        out_json=Path("/Users/wws/interp/results/seed12_agent_vs_optimal_extended.json"),
+    "fourroom": DatasetCfg(
+        name="fourroom_episode_sweep_T0",
+        traj_dir=Path("/Users/wws/interp/data/trajectories/fourroom_episode_sweep_T0"),
+        act_dir=Path("/Users/wws/interp/data/activations/fourroom_episode_sweep_T0"),
+        out_pkl=Path("/Users/wws/interp/results/fourroom_episode_sweep_T0_agent_vs_optimal_extended.pkl"),
+        out_json=Path("/Users/wws/interp/results/fourroom_episode_sweep_T0_agent_vs_optimal_extended.json"),
     ),
     "two_path": DatasetCfg(
-        name="two_path",
+        name="two_path_no_key_T0",
         traj_dir=Path("/Users/wws/interp/data/trajectories/two_path_no_key_T0"),
         act_dir=Path("/Users/wws/interp/data/activations/two_path_no_key_T0"),
-        out_pkl=Path("/Users/wws/interp/results/two_path_agent_vs_optimal_extended.pkl"),
-        out_json=Path("/Users/wws/interp/results/two_path_agent_vs_optimal_extended.json"),
+        out_pkl=Path("/Users/wws/interp/results/two_path_no_key_T0_agent_vs_optimal_extended.pkl"),
+        out_json=Path("/Users/wws/interp/results/two_path_no_key_T0_agent_vs_optimal_extended.json"),
     ),
 }
 
@@ -112,15 +109,12 @@ def make_step(walls, W, H, GOAL):
 def make_step_state(walls, W, H, GOAL, KEY, DOOR):
     """Full-state transition: (col, row, has_key, door_open) → next state.
 
-    - Walls/out-of-bounds: stay.
-    - Door cell is treated as walkable (matches `grid_text` parsing and
-      Seed12's env: agents in `door_open` variants traverse it freely;
-      agents in `standard`/`has_key` variants visibly cannot, but the
-      action set is movement-only — no `toggle` — so we never *update*
-      `door_open` here either way).
-    - Key pickup: walking onto the key cell with `has_key=False` flips
-      `has_key` to True. This is the only flag transition observable
-      in Seed12.
+    - Walls / out-of-bounds: stay in place.
+    - Locked door cell with `has_key=False`: blocked (stay in place).
+    - Locked door cell with `has_key=True`: walk through and auto-open
+      the door (`door_open` flips True).
+    - Key cell with `has_key=False`: pick up the key (`has_key` flips
+      True) and move onto the cell.
     - The goal is terminal.
     """
     def f(state, action):
@@ -272,13 +266,11 @@ def build_phi_table(records):
 def build_dataset(records, phi_table, step_state):
     """Build the next-state-indexed training set.
 
-    Uses the full-state transition `step_state` (key pickup +
-    locked-door auto-open with key) for all 4 actions per record. For
-    the action the agent took, we override the rule-based flags with
-    the trajectory's recorded step-(t+1) flags — the rules can diverge
-    from reality in some Seed12 variants where the door cell is
-    rendered `_` rather than `D`. Counterfactual actions only have
-    the rule-based prediction.
+    Uses the full-state transition `step_state` (walls/bounds, key
+    pickup on contact, locked-door auto-open with key) for all 4
+    actions per record. Records whose any next-state was never
+    observed in the dataset are dropped — the φ-table has no entry
+    for that state.
     """
     state_list = sorted(phi_table.keys())
     s2i = {s: i for i, s in enumerate(state_list)}
@@ -473,9 +465,9 @@ def run_dataset(dataset_key, datasets):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", choices=["seed12", "two_path", "both"], default="both")
+    ap.add_argument("--dataset", choices=["fourroom", "two_path", "both"], default="fourroom")
     args = ap.parse_args()
-    keys = ["seed12", "two_path"] if args.dataset == "both" else [args.dataset]
+    keys = ["fourroom", "two_path"] if args.dataset == "both" else [args.dataset]
     for k in keys:
         run_dataset(k, DATASETS)
 

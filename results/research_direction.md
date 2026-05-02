@@ -1,194 +1,217 @@
 # Research Directions: Belief-Action Gap in GPT-OSS-20B Grid Agents
 
-## Background — what the existing experiments established
+## Background — what the existing experiments establish
 
-On a 9 × 9 fixed-grid task (`Seed12`, door-open variant) the agent
-(GPT-OSS-20B with chain-of-thought) reaches the goal in only 48 % of
-episodes and emits a BFS-optimal action only 43 % of the time.
-However, a **single linear probe** on the layer-15 pre-reasoning
-residual stream (last 3 prompt-suffix tokens, 8640-dim φ) picks the
-BFS-optimal action with **96.3 %** accuracy on held-out visits
-(5-fold CV). That's a **+51.6 pp belief-action gap**: the model
-"knows" the right answer at near-ceiling accuracy in its mid-stack
-residuals, yet acts on it less than half the time.
+On a 9 × 9 fixed-grid doorkey task (`fourroom_episode_sweep_T0`,
+111 trajectories spanning three flag variants `K0D0` / `K1D0` /
+`K1D1`) the agent (GPT-OSS-20B with chain-of-thought) emits a
+BFS-optimal action only **32.5 %** of the time — *worse* than the
+54.8 % majority baseline (UP), because the agent over-emits UP
+while the optimal under the env's actual dynamics is mostly DOWN
+(73 % of optimal labels) or LEFT (toward the key). A **single
+linear cost-IRL probe** on the layer-15 pre-reasoning residual
+stream (last 3 prompt-suffix tokens, 8640-dim φ) picks the
+BFS-optimal action with **96.0 % accuracy** (99.2 % set-membership)
+on held-out visits. That's a **+50.6 pp belief-action gap**.
 
-A layer sweep at the same prompt-suffix position shows the gap is
-flat across depths (+49 / +52 / +42 pp at layers 7 / 15 / 23). A
-per-visit probe on **post-reasoning** activations inverts the result:
-post-reasoning φ predicts the agent's *emitted* action at 92 %
-accuracy and the optimal action at only 52 %. So the geometric belief
-exists at every pre-reasoning depth and never commits to the agent's
-chosen action — the commitment shows up only in the output-token
-positions. **The gap opens during the reasoning chain**, not across
-pre-reasoning depth.
+Two algorithmic refinements vs earlier position-only analyses:
 
-The companion easy task (`two_path_no_key_T0`, 7 × 8 two-corridor
-grid) shows the same shape with a smaller gap (+22 pp) — consistent
-with the agent's higher BFS-optimal rate (75 %) and 98 % success rate.
+1. **State is the 4-tuple** `(col, row, carrying_key, door_open)`,
+   not just `(col, row)`. The φ-table averages activations per
+   state, and the same position with a different flag combination
+   counts as a different state. fourroom has 111 such states across
+   39 walkable cells.
+2. **BFS for optimal-action labels operates over the full state
+   space** using a transition function that models walls/bounds,
+   key pickup on contact, and locked-door auto-open with the key.
+   A `K0D0` agent in the lower room therefore has a *much* longer
+   shortest-path-to-goal (must detour to the key, then to the door)
+   than the same position with the key already collected — and its
+   optimal action points toward the key, not toward the goal.
+   Position-only BFS gave the same distance to both, mislabelling
+   `K0D0` records.
+
+Per-visit MLP decoders on the same activations land within ±2 pp
+of the linear probe (Model A 0.43, Model B 0.96 on prompt-suffix);
+post-reasoning activations are essentially tied with pre-reasoning
+once visits are averaged. The visit-averaged φ washes out the
+"policy-commitment" signal that distinguishes pre vs post.
+
+Per-action breakdown is striking:
+
+| action | Model A acc | Model B acc | n_test |
+|---|---:|---:|---:|
+| LEFT  | 0.764 | 0.958 |  89 / 72  |
+| RIGHT | 0.810 | 0.853 | 126 / 156 |
+| UP    | **0.228** | 0.778 | 527 / 27 |
+| DOWN  | 0.717 | 0.992 | 180 / 667 |
+
+Model A is collapsed on UP (23 %) — the activations encode the
+optimal direction, which is rarely UP under the state-space BFS,
+whereas the agent emits UP 55 % of the time. The activations
+"know" what the right move is conditional on env state; the agent
+chooses something else.
 
 This document lists the most fruitful follow-ups, ordered by
-priority.
+priority. **Direction 2 has already been run on a prior dataset
+with a null result; the others remain open and most should be run
+on `fourroom_episode_sweep_T0`.**
 
 ---
 
 ## Direction 1 — Probe through the reasoning chain
 
-**Question:** at what *point in the chain-of-thought* does the right
-belief get lost?
+**Question:** at what *point in the chain-of-thought* does the
+right belief get lost?
 
-**Motivation.** The two existing probe positions are the extremes:
-prompt-suffix (last 3 tokens before reasoning, belief acc 96 %) and
-output (last few tokens after reasoning, "belief" reads off the
-agent's action with 92 % accuracy). The reasoning trace itself is
-hundreds of tokens long. If the same belief decoder is run at
-intermediate trace positions, we can plot belief-vs-optimal accuracy
-as a function of position-in-trace. Three plausible shapes:
+**Motivation.** The two existing probe positions are extremes:
+prompt-suffix (last 3 tokens before reasoning, belief acc ~96 %)
+and output (last few tokens after reasoning, the per-visit decoder
+reads off the agent's action with high accuracy). The reasoning
+trace itself is hundreds of tokens long. If the same belief
+decoder is run at intermediate trace positions, we can plot
+belief-vs-optimal accuracy as a function of position-in-trace.
+Three plausible shapes:
 
 - **Monotone decay** — belief gradually corrupted as reasoning
   progresses → CoT accumulates errors token by token.
-- **Cliff** — belief stays high until some specific point, then drops
-  → there's a "moment of commitment" we can localise.
-- **Plateau then crash at output** — the geometric belief is
-  preserved through the whole reasoning trace and only the final
-  projection to the action token overrules it → the bug is in the
-  unembedding / output-prediction step, not in the reasoning content.
+- **Cliff** — belief stays high until some specific point, then
+  drops → there's a "moment of commitment" we can localise.
+- **Plateau then crash at output** — geometric belief is preserved
+  through the whole reasoning trace and only the final projection
+  to the action token overrules it → the bug is in the unembedding
+  / output-prediction step, not in the reasoning content.
 
 Each shape implies a different intervention target.
 
+**With the new state-space BFS this is even more interesting**:
+distinct flag variants (`K0D0` / `K1D0` / `K1D1`) have very
+different optimal actions, so the question becomes "does the model
+keep track of `has_key` through the trace, or does CoT drift it
+toward a position-only goal-direction belief?"
+
 **Concrete experiment.**
 1. Re-extract activations at a sample of reasoning-trace positions
-   (e.g. every 20 tokens) for layers 7 / 15 / 23 on the existing
-   trajectories.
-2. Run the same 5-fold CV linear probe with BFS-optimal labels per
-   position.
+   (e.g. every 20 tokens) for layers 7 / 15 / 23 on the
+   `fourroom_episode_sweep_T0` trajectories.
+2. Run the same per-visit linear probe with BFS-optimal labels
+   (state-space) at each position.
 3. Plot belief acc, belief-action agreement, and the gap as a
-   function of position-in-trace.
+   function of position-in-trace, **stratified by variant**
+   (`K0D0` is harder than `K1D1` and the trace might differ).
 4. Bonus: stratify by trajectory outcome (success vs cap-hit) — if
-   the cliff appears in failures but not successes, the location is
+   a cliff appears in failures but not successes, the location is
    the *failure-causing event* in the trace.
 
-**Cost.** Moderate. The expensive part is re-running
-`gather_activations` with a wider token window (or all reasoning
-tokens) for the existing 79 trajectories. ~1–2 hours of GPU time +
-some disk; the analysis itself reuses the existing decoder code.
+**Cost.** Moderate. Re-running `gather_activations` with a wider
+token window for the existing 111 trajectories. ~1–2 h GPU + disk.
 
 **What we'd learn.** Where on the temporal axis (within a single
-forward pass) the geometric belief is overruled. Localising this is a
-prerequisite for any meaningful intervention.
+forward pass) the geometric belief is overruled. Localising this
+is a prerequisite for any meaningful intervention.
 
 ---
 
-## Direction 2 — Causal intervention via the belief direction
+## Direction 2 — Causal intervention via the belief direction *(already run on a prior dataset — null)*
 
-**Question:** is the pre-reasoning belief *causally* responsible for
-the action, or just an epiphenomenal correlate of geometry?
+**Question:** is the pre-reasoning belief *causally* responsible
+for the action, or just an epiphenomenal correlate of geometry?
 
-**Motivation.** All current evidence is correlational — a linear
-decoder achieves X % on layer Y. The cost-IRL `θ` matrix is a literal
-direction in 8640-dim space. If we *intervene* along that direction
-during generation, two outcomes are diagnostic:
+**Status.** Run with the prior dataset
+(`results/causal_intervention_results.md`). **Null result**:
+belief-direction perturbation at layer-15 prompt-suffix didn't
+flip the action significantly more than a random direction of the
+same norm at any α ∈ {0, 0.5, 1, 2, 4, 8}. McNemar p > 0.05 at
+every α. The model's output prior dominated: some target actions
+were never reached regardless of steering direction (e.g.
+`belief=DOWN` flipped 0 / 23 cases).
 
-- **Steering works** → belief is on the causal path; the gap is a
-  bottleneck we can close with a single rank-1 edit.
-- **Steering doesn't work** → belief is a passive correlate; the
-  decoder accuracy is real but not actionable for behaviour change.
+That run used a problematic dataset (mislabelled flags, only one
+variant per agent, position-only BFS labels). The current fourroom
+data is cleaner; a re-run is defensible.
 
-**Concrete experiment.**
-1. From the per-visit pre-reasoning probe, extract the per-action
-   weight vectors `θ_a ∈ ℝ^{8640}`.
-2. At inference time on a held-out trajectory, identify states where
-   the agent is about to take a non-optimal action.
-3. At layer 15, prompt-suffix positions: add a multiple `+α · θ_optimal`
-   and subtract `α · θ_agent` (or just `+α · θ_optimal`) to the residual
-   stream, then let the model continue.
-4. Sweep `α ∈ {0, 0.5, 1, 2, 4, 8}`. Measure (a) action change rate,
-   (b) shift in action-vs-optimal accuracy, (c) any reasoning-chain
-   text changes.
-5. Negative control: intervene with a random direction of equal norm.
-
-**Cost.** Low. `nnsight` makes this a few-line patch; reuses the
-already-trained probe. Wall-clock dominated by inference, ~minutes
-per trajectory on a single GPU.
-
-**What we'd learn.** Whether the geometric belief in pre-reasoning φ
-is a load-bearing intermediate state in the agent's decision pipeline
-or a side-channel readout. Either answer dictates the next step.
+**Re-run on fourroom?** Same script with the new dataset and
+state-space BFS; budget is the same as the prior run. **Demote
+from "first" to "after Direction 1"** — without knowing where the
+belief gets lost, intervening at the prompt-suffix is shooting in
+the dark.
 
 ---
 
 ## Direction 3 — What replaces geometry at layer 23?
 
-**Question:** what does the late residual stream encode that crowds
-out the clean linear geometric signal?
+**Question:** what does the late residual stream encode that
+crowds out the clean linear geometric signal?
 
-**Motivation.** Belief accuracy drops 96.3 → 86.2 % on Seed12 between
-layers 15 and 23 at the same token positions. The 10 pp of geometric
-information must go somewhere — late layers are doing useful work,
-not discarding features. Candidate hypotheses:
+**Motivation.** Earlier (position-only-BFS) layer sweeps showed
+belief accuracy dropping ~10 pp from layer 15 to layer 23 at the
+same token positions. Whether this drop reproduces on fourroom
+with state-space BFS is **the prerequisite for this direction**.
 
-- **Action-token bias** — the residual is being rotated to align
-  with the unembedding directions of LEFT / RIGHT / UP / DOWN tokens
-  (in which case late layers ARE committing, just to the *wrong*
-  action — and the post-reasoning result is a continuation of this).
-- **Wall / obstacle encoding** — late residual prepares for "is this
-  cell a wall?" prediction, sharpening obstacle features at the cost
-  of goal-direction features.
-- **Plan-state / loop-detection** — the model has noticed it's stuck
-  in a loop and is encoding meta-state about its own trajectory.
+Pre-fourroom hypotheses for what's encoded at layer 23 instead:
+
+- **Action-token bias** — residual being rotated to align with
+  unembedding directions of LEFT / RIGHT / UP / DOWN tokens (i.e.
+  late layers ARE committing, but to the *wrong* action — and the
+  post-reasoning decoder result is a continuation of this).
+- **Wall / obstacle encoding** — late residual prepares for
+  "is this cell a wall?" prediction.
+- **Plan-state / loop-detection** — the model has noticed it's
+  stuck in a loop and is encoding meta-state about its own
+  trajectory.
+- **Variant / phase tracking** — *new hypothesis*: late layers
+  switch from "where is the goal geometrically" to "what task
+  phase am I in (find-key / approach-door / approach-goal)". This
+  would explain why position-conditional belief drops while the
+  action is still being decided correctly.
 
 **Concrete experiment.**
-1. Train probes at layer 23 for each candidate target:
-   - Action-token bias: project layer-23 residual onto the four
-     action-token unembedding rows; see if this projection alone
-     predicts the agent's action.
-   - Wall map: train a probe to predict "is the cell at position P a
-     wall?" for each position P relative to the agent.
-   - Loop detection: probe for "have I visited this cell in this
-     trajectory before?".
-2. Compare each probe's accuracy at layer 15 vs layer 23.
-3. Subtract: which feature *gains* the most from layer 15 → 23? That
-   is the candidate that's being encoded *instead* of geometry.
+1. **First** re-run the layer sweep on fourroom with the
+   state-space BFS labels: does the layer-15 → 23 gap persist?
+2. Train probes at layer 23 for each candidate target (action-token
+   bias, wall map, loop detection, phase indicator).
+3. Compare each probe's accuracy at layer 15 vs layer 23.
+4. Subtract: which feature *gains* the most from layer 15 → 23?
+   That is the candidate being encoded *instead* of geometry.
 
 **Cost.** Low–moderate. Each probe is a single linear layer; data
-already in hand.
+in hand once the layer sweep runs.
 
 **What we'd learn.** A more mechanistic picture of what late
-pre-reasoning layers are computing. If the answer is action-token
-bias, we have evidence that the action commitment **does** happen at
-prompt-suffix positions in the late stack — which would correct the
-current finding.
+pre-reasoning layers are computing.
 
 ---
 
 ## Direction 4 — Failure prediction from live belief-action divergence
 
-**Question:** can we predict episode failure ahead of time from the
-running belief-action gap?
+**Question:** can we predict episode failure ahead of time from
+the running belief-action gap?
 
-**Motivation.** Per-trajectory data already hints at a clean
-relationship: Seed12 trajectories with internal disagreement rate
-≤ 5 % are 1–9 step successes; trajectories with rate ≥ 80 % all hit
-the 30-step cap without reaching the goal. A real-time monitor
-watching a single linear projection of layer-15 activations could
-flag "this episode is going off the rails" several steps before the
-failure manifests in behaviour.
+**Motivation.** The belief-action gap is enormous (+51 pp on
+fourroom) and the per-trajectory disagreement rate is the natural
+real-time monitor. fourroom's 3 variants give a stronger test:
+`K0D0` agents face the hardest task (must find key first), so the
+disagreement-rate-vs-failure relationship can be characterised per
+variant.
 
 **Concrete experiment.**
 1. For each trajectory, compute the per-step belief-action
    disagreement (binary).
-2. Train a sequence classifier `P(success | disagreement_history[:t])`
-   for varying horizons `t`. Logistic regression on the cumulative
-   rate is a fine baseline.
-3. Measure: at step `t`, what fraction of about-to-fail trajectories
-   does the monitor catch, and at what false-positive rate?
+2. Train a sequence classifier
+   `P(success | disagreement_history[:t])` for varying horizons
+   `t`. Logistic regression on the cumulative rate is a fine
+   baseline.
+3. Measure: at step `t`, what fraction of about-to-fail
+   trajectories does the monitor catch, at what false-positive
+   rate? Stratify by variant.
 4. Compare against simpler baselines (number of revisits, current
    BFS-distance-to-goal, raw step count).
 
-**Cost.** Trivial. Reuses existing belief predictions; it's a
-sequence-modelling problem on ~10 k transitions.
+**Cost.** Trivial. Reuses existing belief predictions; sequence
+modelling on ~4 600 transitions.
 
 **What we'd learn.** Whether the belief-action gap is a useful
-runtime safety signal for grid-LLM agents — a practical payoff
+runtime safety signal for grid-LLM agents — practical payoff
 independent of the deeper mechanistic questions.
 
 ---
@@ -198,73 +221,121 @@ independent of the deeper mechanistic questions.
 **Question:** is chain-of-thought making the model *worse* at this
 task?
 
-**Motivation.** Strong version of the gap-during-reasoning finding:
-CoT *actively corrupts* a correct geometric belief that's already
-present pre-reasoning. GPT-OSS-20B exposes a `reasoning_effort`
-setting (`low / medium / high`); the existing Seed12 trajectories
-use `medium`.
+**Motivation.** Strong version of the gap-during-reasoning
+finding: CoT *actively corrupts* a correct geometric belief that's
+already present pre-reasoning. GPT-OSS-20B exposes a
+`reasoning_effort` setting (`low / medium / high`); the existing
+fourroom trajectories use `medium`.
 
 **Concrete experiment.**
-1. Re-collect trajectories from the same starting positions with
-   `reasoning_effort ∈ {low, medium, high}` (and ideally `none`,
-   if the harmony format allows it).
+1. Re-collect trajectories from the same starting positions and
+   variants with `reasoning_effort ∈ {low, medium, high}` (and
+   ideally `none` if the harmony format allows).
 2. Plot:
-   - Pre-reasoning belief accuracy (constant across runs — property
-     of φ, not of CoT length).
+   - Pre-reasoning belief accuracy (should be approximately
+     constant — property of φ, not of CoT length).
    - Action-vs-optimal accuracy.
    - Belief-action gap.
    - Post-reasoning probe results (does post-reasoning φ commit
      more strongly with longer reasoning?).
-3. Compute the *cost* of reasoning per problem: total tokens emitted
-   vs accuracy gained.
+3. Compute the *cost* of reasoning per problem: total tokens
+   emitted vs accuracy gained.
 
-**Cost.** Moderate. Requires re-running 79 episodes × 3 reasoning
-levels = 237 episodes through `together_ai`, plus re-extracting
-activations.
+**Cost.** Moderate. Requires re-running 111 episodes × 3
+reasoning levels, plus re-extracting activations.
 
-**What we'd learn.** Whether CoT is hurting or helping on geometric
-tasks for this model. If the gap *grows* with reasoning effort, that
-is empirical evidence that CoT can introduce errors absent in
-prompt-only inference — a finding directly in tension with the
-mainstream "more reasoning = better" narrative for arithmetic and
-multi-step problems.
+**What we'd learn.** Whether CoT is hurting on geometric tasks
+for this model. If the gap *grows* with reasoning effort, that's
+empirical evidence that CoT can introduce errors absent in
+prompt-only inference — directly in tension with the mainstream
+"more reasoning = better" narrative.
+
+---
+
+## Direction 6 — Does φ encode (has_key, door_open)?
+
+**Question:** the state-space BFS makes the optimal action depend
+critically on `(has_key, door_open)`. A `K0D0` agent at (3, 6)
+should head LEFT/UP toward the key, while a `K1D1` agent at the
+same position should head LEFT/UP toward the door + goal. The
+linear probe achieves 96 % at distinguishing these. Is that
+because φ encodes the flags directly, or because it encodes
+"distance to next sub-goal" which already wraps the flag
+information?
+
+**Motivation.** This is the cleanest mechanistic question raised
+by the new state-space algorithm. Two separable hypotheses:
+
+- **Flags-then-geometry**: φ has linear directions for `has_key`
+  and `door_open`, and geometric directions for goal/key/door.
+  Optimal action is decoded by combining them.
+- **Direct sub-goal direction**: φ encodes "direction to current
+  sub-goal" as a single feature, with the sub-goal already chosen
+  internally. Flags don't appear as separable directions.
+
+**Concrete experiment.**
+1. Train binary linear probes at layer 15 for `has_key` and
+   `door_open`. Hold-out trajectories.
+2. Train a 4-class probe for the *current sub-goal* (key / door /
+   goal / done).
+3. Compare accuracies; if flags are recoverable at near-100 %,
+   they're encoded directly. If sub-goal is also recoverable at
+   near-100 %, that's the "more compact" representation.
+4. Bonus: project the cost-IRL θ onto each of these directions —
+   if θ aligns mostly with the sub-goal direction, that's the
+   primary signal.
+
+**Cost.** Trivial. Reuses existing activations and trajectory
+flags.
+
+**What we'd learn.** Whether the model's grid representation is
+factored (flags + geometry) or compressed (sub-goal pointer).
+Bears directly on Direction 3 (what changes layer 15 → 23?) — if
+the model represents sub-goals, the layer-23 shift might be
+"refining the sub-goal pointer" rather than "encoding geometry".
 
 ---
 
 ## Recommended order
 
 ```
-2  Causal intervention   ← cheapest qualitative test
-└─ if works → 5  Reasoning ablation     ← why is CoT overruling a good belief?
-└─ if not   → 1  Probe through trace    ← where is the "real" decision made?
-                3  Layer-23 mechanism   ← what crowds out geometry?
+1  Probe through reasoning chain     ← localise where belief is lost
+└─ then  3  Layer-23 mechanism       ← what crowds out geometry
+└─ or    2  Causal intervention      ← only if Direction 1 reveals a localisable target
 
-4  Failure prediction  ← independent, near-zero cost, run in parallel
+6  Flags vs sub-goal              ← cheap mechanistic question, run anytime
+4  Failure prediction             ← independent, near-zero cost, run in parallel
+5  Reasoning-effort sweep         ← moderate cost, run last
 ```
 
-**Direction 2 first.** A clear causal-intervention result either
-hands us a steering tool (one rank-1 edit closes the gap) or rules
-out the simplest interpretation of the existing evidence. Either
-outcome dictates the rest of the agenda.
+**Direction 1 first.** With Direction 2 already null on the prior
+dataset, locating *where* the belief gets corrupted is the next
+informative thing. The intervention experiment makes most sense
+once we know the right place to intervene.
 
-**Direction 4 in parallel.** It's almost free — the data is already
-on disk and the analysis is a 50-line script. The result is useful
-independent of the mechanistic story.
+**Direction 6 in parallel.** ~50 lines of code on data already on
+disk; resolves a cleanly-posed mechanistic question.
 
-**Direction 1 next** if Direction 2 negative, or alongside Direction
-5 if Direction 2 positive.
+**Direction 4 in parallel** for the practical-payoff thread.
+
+**Direction 5 last** — it's the most expensive (re-collecting
+trajectories at three reasoning levels) and depends on the
+qualitative shape of Direction 1's result.
 
 ---
 
 ## Files this proposal builds on
 
-- `results/seed12_agent_vs_optimal_results.md` — main Seed12 report,
-  including the per-visit and layer-sweep extensions
-- `results/two_path_agent_vs_optimal_results.md` — companion easy-task report
-- `results/belief_action_gap.md` — the canonical belief-action gap
-  analysis (single layer + layer sweep)
-- `results/belief_action_gap_layers.md` — layer sweep stand-alone
-- `run_belief_action_gap.py`, `run_belief_action_gap_layers.py` — the
-  decoder pipeline that any new experiment can extend
-- `cost_updated.ipynb` — the original linear `LinearCostIRL` from
-  which the per-visit decoder is derived
+- `results/fourroom_episode_sweep_T0_agent_vs_optimal_results.md`
+  — main report on the current dataset
+- `results/two_path_no_key_T0_agent_vs_optimal_extended.{json,pkl}`
+  — companion easy-task data
+- `results/causal_intervention_results.md` — Direction 2 (null
+  result, prior dataset)
+- `run_agent_vs_optimal_extended.py` — the cost-IRL pipeline
+  (state-space BFS + auto-open transition)
+- `run_belief_action_gap.py`, `run_belief_action_gap_layers.py` —
+  the per-visit decoder pipeline that any new experiment can
+  extend
+- `cost_updated.ipynb` — the original linear `LinearCostIRL`
+  reference implementation
