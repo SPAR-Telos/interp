@@ -169,6 +169,10 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--max-new-tokens", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--n-pos", type=int, default=3,
+                    help="Number of trailing prompt positions to capture/replace. "
+                         "Default 3. Set to the full suffix length (e.g., 19) to "
+                         "patch the entire Agent-status block.")
     args = ap.parse_args()
 
     if args.temperature <= 0.0:
@@ -195,7 +199,8 @@ def main():
           f"recorded={pb['agent_action_recorded']}  len={pb['prompt_len']}")
 
     # `model.layers` is a property aliasing model.model.layers (a Python list).
-    hook = HookedLayer(model.model.layers, args.layer, n_pos=3)
+    hook = HookedLayer(model.model.layers, args.layer, n_pos=args.n_pos)
+    print(f"  patching last {args.n_pos} positions of the prompt")
 
     try:
         # ── Capture act_a, act_b from the live MLX model ───────────────
