@@ -1,0 +1,118 @@
+{
+  "dataset": {
+    "agent_rows": [],
+    "class_counts": {
+      "False": 6,
+      "True": 6
+    },
+    "n_pos": 3,
+    "num_samples": 12,
+    "num_states": 6,
+    "path": "flag_swap/door_key_grid/final_channel_last3_v2/probe_family_matched/paired_probe_activations.pt",
+    "probe_family": "door-key-grid",
+    "prompt_path": "flag_swap/door_key_grid/final_channel_last3_v2/probe_family_matched/paired_probe_prompts.jsonl",
+    "prompt_suffix_indices": "-3:-1",
+    "suffix_positions_example": [
+      214,
+      215,
+      216
+    ],
+    "suffix_relative_indices": [
+      0,
+      1,
+      2
+    ]
+  },
+  "layers": {
+    "15": {
+      "class_counts": {
+        "0": 6,
+        "1": 6
+      },
+      "class_gap": 113.27399833271765,
+      "coef_norm": 0.16977914704872593,
+      "direction_norm": 1.0,
+      "direction_path": "flag_swap/door_key_grid/final_channel_last3_v2/probe_family_matched/has_key_direction_layer_15.pt",
+      "eval_accuracy": 1.0,
+      "eval_balanced_accuracy": 1.0,
+      "eval_state_ids": [
+        0,
+        1
+      ],
+      "layer": 15,
+      "logistic_c": 0.01,
+      "logistic_solver": "liblinear",
+      "num_eval": 4,
+      "num_samples": 12,
+      "num_train": 8,
+      "train_accuracy_all_states": 1.0,
+      "train_balanced_accuracy_all_states": 1.0,
+      "train_state_ids": [
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    "23": {
+      "class_counts": {
+        "0": 6,
+        "1": 6
+      },
+      "class_gap": 3387.8015563123263,
+      "coef_norm": 0.12327271068135022,
+      "direction_norm": 1.0,
+      "direction_path": "flag_swap/door_key_grid/final_channel_last3_v2/probe_family_matched/has_key_direction_layer_23.pt",
+      "eval_accuracy": 1.0,
+      "eval_balanced_accuracy": 1.0,
+      "eval_state_ids": [
+        0,
+        1
+      ],
+      "layer": 23,
+      "logistic_c": 0.01,
+      "logistic_solver": "liblinear",
+      "num_eval": 4,
+      "num_samples": 12,
+      "num_train": 8,
+      "train_accuracy_all_states": 1.0,
+      "train_balanced_accuracy_all_states": 1.0,
+      "train_state_ids": [
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    "7": {
+      "class_counts": {
+        "0": 6,
+        "1": 6
+      },
+      "class_gap": 11.163066905528648,
+      "coef_norm": 0.17550569355386264,
+      "direction_norm": 1.0,
+      "direction_path": "flag_swap/door_key_grid/final_channel_last3_v2/probe_family_matched/has_key_direction_layer_7.pt",
+      "eval_accuracy": 0.5,
+      "eval_balanced_accuracy": 0.5,
+      "eval_state_ids": [
+        0,
+        1
+      ],
+      "layer": 7,
+      "logistic_c": 0.01,
+      "logistic_solver": "liblinear",
+      "num_eval": 4,
+      "num_samples": 12,
+      "num_train": 8,
+      "train_accuracy_all_states": 1.0,
+      "train_balanced_accuracy_all_states": 1.0,
+      "train_state_ids": [
+        2,
+        3,
+        4,
+        5
+      ]
+    }
+  }
+}
