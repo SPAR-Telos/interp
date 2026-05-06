@@ -62,9 +62,8 @@ def _process_single_trajectory(
     """
     # Get shared token data
     prefix_tokens = trajectory["prompt"]["prompt_prefix_tokens"]
-    suffix_tokens = trajectory["prompt"]["prompt_suffix_tokens"]
     n_prefix = len(prefix_tokens)
-    n_suffix = len(suffix_tokens)
+    suffix_tokens = trajectory["prompt"]["prompt_suffix_tokens"]
 
     steps_to_process = [trajectory["steps"][i] for i in step_indices]
 
@@ -98,7 +97,6 @@ def _process_single_trajectory(
             output_base=output_base,
             layer_indices=layer_indices,
             n_prefix=n_prefix,
-            n_suffix=n_suffix,
             prefix_activations=prefix_activations,
             has_step_dependent=has_step_dependent,
             has_grid=has_grid,
@@ -125,7 +123,6 @@ def _process_single_step(
     output_base: Path,
     layer_indices: list[int],
     n_prefix: int,
-    n_suffix: int,
     prefix_activations: dict | None,
     has_step_dependent: bool,
     has_grid: bool,
@@ -145,7 +142,9 @@ def _process_single_step(
     step_idx = step["step_id"]
     grid_tokens = step["grid_state_tokens"]
     output_tokens = step["output_tokens"]
+    step_suffix_tokens = step.get("prompt_suffix_tokens", suffix_tokens)
     n_grid = len(grid_tokens)
+    n_suffix = len(step_suffix_tokens)
 
     nan_count = 0
     total_count = 0
@@ -175,7 +174,7 @@ def _process_single_step(
         extraction_tasks.append(("grid_state", grid_indices, absolute_grid))
 
     if has_suffix:
-        suffix_indices = resolve_token_indices(prompt_suffix_indices, suffix_tokens, "prompt_suffix")
+        suffix_indices = resolve_token_indices(prompt_suffix_indices, step_suffix_tokens, "prompt_suffix")
         absolute_suffix = [suffix_start + idx for idx in suffix_indices]
         extraction_tasks.append(("prompt_suffix", suffix_indices, absolute_suffix))
 
@@ -252,7 +251,7 @@ def extract_activations_from_trajectories(
         prompt_prefix_indices: Indices for prompt_prefix tokens (None = skip)
         prompt_suffix_indices: Indices for prompt_suffix tokens (None = skip)
         grid_state_indices: Indices for grid_state tokens (None = skip)
-        output_indices: Indices for output tokens (None = skip)
+        output_indices: Indices or token-group specs for output tokens (None = skip)
         device_map: Device mapping for model loading
         torch_dtype: Torch dtype for model ("auto", "bfloat16", "float16")
         debug: If True, print the first truncated input text to verify format

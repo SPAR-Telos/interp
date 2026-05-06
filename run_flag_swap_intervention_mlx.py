@@ -20,18 +20,18 @@ during generation steps (seq_len == 1), it's a no-op.
 
 Mac-only.
 """
+
 from __future__ import annotations
+
 import argparse
 import json
 import re
-import sys
 import time
 from pathlib import Path
 
 import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
-
 
 ACTIONS = ["LEFT", "RIGHT", "UP", "DOWN"]
 ACTION_RE = re.compile(r'"action"\s*:\s*"(LEFT|RIGHT|UP|DOWN)"', re.IGNORECASE)
@@ -63,6 +63,7 @@ class HookedLayer:
       'capture'     — call original, store last n_pos positions in self.captured
       'replace'     — call original, then overwrite last n_pos positions with self.donor
     """
+
     def __init__(self, parent_list, idx: int, n_pos: int):
         self.parent_list = parent_list
         self.idx = idx
@@ -83,7 +84,7 @@ class HookedLayer:
         self.fired = True
         self.last_seq_len = out.shape[1]
         if self.mode == "capture":
-            self.captured = out[0, -self.n_pos:, :]
+            self.captured = out[0, -self.n_pos :, :]
         elif self.mode == "replace":
             assert self.donor is not None, "donor must be set for replace mode"
             n = self.n_pos
@@ -108,15 +109,17 @@ def generate_one(model, tokenizer, prompt_token_ids, sampler, max_tokens: int) -
     """Run a single sampled generation. Returns the generated text."""
     pieces = []
     for chunk in stream_generate(
-        model, tokenizer, prompt=prompt_token_ids,
-        max_tokens=max_tokens, sampler=sampler,
+        model,
+        tokenizer,
+        prompt=prompt_token_ids,
+        max_tokens=max_tokens,
+        sampler=sampler,
     ):
         pieces.append(chunk.text)
     return "".join(pieces)
 
 
-def run_condition(model, tokenizer, hook, prompt_token_ids, donor, n_samples,
-                  temperature, max_new_tokens, base_seed):
+def run_condition(model, tokenizer, hook, prompt_token_ids, donor, n_samples, temperature, max_new_tokens, base_seed):
     """Generate n_samples completions of `prompt_token_ids` with the
     layer-15 hook configured per the (donor or None) argument."""
     if donor is None:
@@ -128,8 +131,12 @@ def run_condition(model, tokenizer, hook, prompt_token_ids, donor, n_samples,
     hook.fired = False
 
     out = []
-    log = {"fired": False, "seq_len": None, "mode": hook.mode,
-           "donor_norm": float(mx.linalg.norm(donor)) if donor is not None else None}
+    log = {
+        "fired": False,
+        "seq_len": None,
+        "mode": hook.mode,
+        "donor_norm": float(mx.linalg.norm(donor)) if donor is not None else None,
+    }
 
     for k in range(n_samples):
         # Distinct random seed per sample for genuine variability.
@@ -149,7 +156,7 @@ def capture_activations(model, tokenizer, hook, prompt_token_ids):
     hook.reset()
     hook.mode = "capture"
     hook.donor = None
-    sampler = make_sampler(temp=0.0)   # need just 1 token; sampling doesn't matter
+    sampler = make_sampler(temp=0.0)  # need just 1 token; sampling doesn't matter
     # max_tokens=1 forces only the prompt-processing pass + 1 generation step.
     _ = generate_one(model, tokenizer, prompt_token_ids, sampler, max_tokens=1)
     cap = hook.captured
@@ -167,12 +174,16 @@ def main():
     ap.add_argument("--layer", type=int, default=15)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--max-new-tokens", type=int, default=1024)
+    ap.add_argument("--max-new-tokens", type=int, default=4096, help="Maximum generated tokens per sample.")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--n-pos", type=int, default=3,
-                    help="Number of trailing prompt positions to capture/replace. "
-                         "Default 3. Set to the full suffix length (e.g., 19) to "
-                         "patch the entire Agent-status block.")
+    ap.add_argument(
+        "--n-pos",
+        type=int,
+        default=3,
+        help="Number of trailing prompt positions to capture/replace. "
+        "Default 3. Set to the full suffix length (e.g., 19) to "
+        "patch the entire Agent-status block.",
+    )
     args = ap.parse_args()
 
     if args.temperature <= 0.0:
@@ -193,10 +204,14 @@ def main():
     rows = [json.loads(l) for l in open(args.prompts) if l.strip()]
     by_label = {r["label"]: r for r in rows}
     pa, pb = by_label["a"], by_label["b"]
-    print(f"  prompt a: variant={pa['variant']} pos={pa['pos']} "
-          f"recorded={pa['agent_action_recorded']}  len={pa['prompt_len']}")
-    print(f"  prompt b: variant={pb['variant']} pos={pb['pos']} "
-          f"recorded={pb['agent_action_recorded']}  len={pb['prompt_len']}")
+    print(
+        f"  prompt a: variant={pa['variant']} pos={pa['pos']} "
+        f"recorded={pa['agent_action_recorded']}  len={pa['prompt_len']}"
+    )
+    print(
+        f"  prompt b: variant={pb['variant']} pos={pb['pos']} "
+        f"recorded={pb['agent_action_recorded']}  len={pb['prompt_len']}"
+    )
 
     # `model.layers` is a property aliasing model.model.layers (a Python list).
     hook = HookedLayer(model.model.layers, args.layer, n_pos=args.n_pos)
@@ -206,24 +221,28 @@ def main():
         # ── Capture act_a, act_b from the live MLX model ───────────────
         print("\nCapturing act_a from prompt a ...", flush=True)
         act_a = capture_activations(model, tokenizer, hook, pa["full_token_ids"])
-        print(f"  act_a shape={tuple(act_a.shape)} dtype={act_a.dtype} "
-              f"per-token-norm={[round(float(mx.linalg.norm(act_a[i])), 1) for i in range(act_a.shape[0])]}")
+        print(
+            f"  act_a shape={tuple(act_a.shape)} dtype={act_a.dtype} "
+            f"per-token-norm={[round(float(mx.linalg.norm(act_a[i])), 1) for i in range(act_a.shape[0])]}"
+        )
         print("Capturing act_b from prompt b ...", flush=True)
         act_b = capture_activations(model, tokenizer, hook, pb["full_token_ids"])
-        print(f"  act_b shape={tuple(act_b.shape)} dtype={act_b.dtype} "
-              f"per-token-norm={[round(float(mx.linalg.norm(act_b[i])), 1) for i in range(act_b.shape[0])]}")
+        print(
+            f"  act_b shape={tuple(act_b.shape)} dtype={act_b.dtype} "
+            f"per-token-norm={[round(float(mx.linalg.norm(act_b[i])), 1) for i in range(act_b.shape[0])]}"
+        )
         diff = act_a.astype(mx.float32) - act_b.astype(mx.float32)
         diff_norm_per_tok = [round(float(mx.linalg.norm(diff[i])), 2) for i in range(diff.shape[0])]
         print(f"  ||act_a − act_b|| per token: {diff_norm_per_tok}")
 
         # ── Six conditions ─────────────────────────────────────────────
         conditions = [
-            ("baseline-a",     pa, None),
-            ("baseline-b",     pb, None),
-            ("self-a",         pa, act_a),
-            ("self-b",         pb, act_b),
-            ("swap-a-from-b",  pa, act_b),
-            ("swap-b-from-a",  pb, act_a),
+            ("baseline-a", pa, None),
+            ("baseline-b", pb, None),
+            ("self-a", pa, act_a),
+            ("self-b", pb, act_b),
+            ("swap-a-from-b", pa, act_b),
+            ("swap-b-from-a", pb, act_a),
         ]
         n_written = 0
         with open(args.output, "w") as fout:
@@ -231,7 +250,9 @@ def main():
                 print(f"\n=== {cond_name} (N={args.n_samples}) ===", flush=True)
                 t1 = time.time()
                 samples, log = run_condition(
-                    model, tokenizer, hook,
+                    model,
+                    tokenizer,
+                    hook,
                     prompt_token_ids=prompt_row["full_token_ids"],
                     donor=donor,
                     n_samples=args.n_samples,
@@ -240,6 +261,7 @@ def main():
                     base_seed=args.seed + cond_idx * 10_000,
                 )
                 from collections import Counter
+
                 ac = Counter(s["action"] for s in samples)
                 print(f"  action distribution: {dict(ac)}", flush=True)
                 print(f"  hook log: {log}  elapsed={time.time() - t1:.1f}s", flush=True)

@@ -40,7 +40,7 @@ Each `.pt` file contains the activation tensor for a single token at the specifi
 | `prompt_prefix_indices` | str \| None | None | Token indices for prompt_prefix (None = skip) |
 | `prompt_suffix_indices` | str \| None | None | Token indices for prompt_suffix (None = skip) |
 | `grid_state_indices` | str \| None | None | Token indices for grid_state (None = skip) |
-| `output_indices` | str \| None | None | Token indices for output (None = skip, "all" = all available) |
+| `output_indices` | str \| None | None | Token indices or token groups for output (None = skip, "all" = all available) |
 | `device_map` | str | "auto" | Device mapping for model loading |
 | `torch_dtype` | str | "auto" | Torch dtype ("auto", "bfloat16", "float16") |
 | `debug` | bool | False | Print first truncated input text to verify format |
@@ -55,6 +55,9 @@ The `layers`, `steps`, and token index parameters support flexible specification
 - `"0:10"` - Range (inclusive, 0 to 10)
 - `"-1"` - Last index
 - `"-3:-1"` - Last 3 indices
+- `"analysis"` / `"@analysis"` - All tokens tagged with a token group
+- `"@analysis/10"` - Every 10th token within the analysis token group
+- `"-16:-14,@analysis/10"` - Mixed numeric and token-group specifications
 
 ## Examples
 

@@ -8,6 +8,7 @@ import pytest
 import torch
 from telos_interp.commands.gather_activations.gather_activations_utils import (
     parse_index_specification,
+    resolve_token_indices,
     sanitize_model_id,
 )
 from telos_interp.commands.gather_activations.trajectory_activations import (
@@ -135,6 +136,41 @@ class TestParseIndexSpecification:
         """Test whitespace is handled correctly."""
         assert parse_index_specification("  0  ,  1  ,  2  ", 10) == [0, 1, 2]
         assert parse_index_specification(" 0 - 5 ", 10) == [0, 1, 2, 3, 4, 5]
+
+
+# =============================================================================
+# Tests for resolve_token_indices
+# =============================================================================
+
+
+class TestResolveTokenIndices:
+    """Tests for resolving numeric and token-group index specifications."""
+
+    @pytest.fixture
+    def output_tokens(self):
+        """Create output tokens with analysis groups for group-relative selection."""
+        tokens = []
+        for i in range(40):
+            groups = ["output"]
+            if i < 35:
+                groups.append("analysis")
+            if i >= 35:
+                groups.append("final")
+            tokens.append({"id": i, "token": f"tok_{i}", "token_id": i, "token_groups": groups})
+        return tokens
+
+    def test_analysis_group_without_prefix(self, output_tokens):
+        assert resolve_token_indices("analysis", output_tokens, "output") == list(range(35))
+
+    def test_analysis_group_with_prefix(self, output_tokens):
+        assert resolve_token_indices("@analysis", output_tokens, "output") == list(range(35))
+
+    def test_analysis_group_stride(self, output_tokens):
+        assert resolve_token_indices("@analysis/10", output_tokens, "output") == [0, 10, 20, 30]
+
+    def test_mixed_numeric_and_group_stride(self, output_tokens):
+        result = resolve_token_indices("-16:-14,@analysis/10", output_tokens, "output")
+        assert result == [0, 10, 20, 24, 25, 26, 30]
 
 
 # =============================================================================

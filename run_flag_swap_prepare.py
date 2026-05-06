@@ -29,7 +29,9 @@ Outputs:
 
 Mac CPU only.
 """
+
 from __future__ import annotations
+
 import argparse
 import json
 import re
@@ -37,13 +39,23 @@ from pathlib import Path
 
 import torch
 
-
 VARIANT_RE = re.compile(r"(K\d+D\d+)")
 LAYER = "layer_15"
 TOKEN_POS = "prompt_suffix"
 N_DONOR_TOKENS = 3
 HIDDEN_DIM = 2880
 TARGET_CELL = (1, 5)
+SIMPLE_CORRIDOR_TARGET_CELL = (1, 4)
+SIMPLE_CORRIDOR_ROWS = [
+    ["#", "#", "#"],
+    ["#", "G", "#"],
+    ["#", "_", "#"],
+    ["#", "D", "#"],
+    ["#", "A", "#"],
+    ["#", "_", "#"],
+    ["#", "K", "#"],
+    ["#", "#", "#"],
+]
 
 
 # Two sentences in the prefix instructions contradict the symmetric prompt b
@@ -76,10 +88,80 @@ def rewrite_prefix(prefix_tokens: list, tokenizer) -> list:
             raise SystemExit(f"prefix rewrite target not found in prefix:\n  {old!r}")
         text = text.replace(old, new)
     new_ids = tokenizer.encode(text, add_special_tokens=False)
+    return [{"token_id": tid, "token": tokenizer.convert_ids_to_tokens(tid)} for tid in new_ids]
+
+
+def load_template_trajectory(traj_dir: Path) -> dict:
+    for tp in sorted(traj_dir.glob("together_ai*.json")):
+        with open(tp) as f:
+            return json.load(f)
+    raise SystemExit(f"no trajectory JSON files found in {traj_dir}")
+
+
+def encode_token_dicts(text: str, tokenizer, token_groups: list[str]) -> list[dict]:
+    ids = tokenizer.encode(text, add_special_tokens=False)
     return [
-        {"token_id": tid, "token": tokenizer.convert_ids_to_tokens(tid)}
-        for tid in new_ids
+        {
+            "id": i,
+            "token": tokenizer.convert_ids_to_tokens(tid),
+            "token_id": tid,
+            "token_groups": token_groups,
+        }
+        for i, tid in enumerate(ids)
     ]
+
+
+def render_grid(rows: list[list[str]]) -> str:
+    width = len(rows[0])
+    lines = ["  " + " ".join(str(c) for c in range(width)) + " "]
+    for r, cells in enumerate(rows):
+        if len(cells) != width:
+            raise ValueError("simple corridor rows must all have equal width")
+        lines.append(f"{r} " + " ".join(cells) + " ")
+    return "\n".join(lines) + " "
+
+
+def build_suffix_tokens(carrying_key: bool, tokenizer) -> list[dict]:
+    text = (
+        "\n\nAgent status:\n"
+        f"- Carrying key: {'True' if carrying_key else 'False'}\n"
+        "- Door open: False<|end|><|start|>assistant"
+    )
+    return encode_token_dicts(text, tokenizer, ["prompt"])
+
+
+def build_synthetic_prompt_row(
+    label: str,
+    variant: str,
+    carrying_key: bool,
+    prefix_tokens: list,
+    grid_tokens: list,
+    suffix_tokens: list,
+) -> dict:
+    n_prefix = len(prefix_tokens)
+    n_grid = len(grid_tokens)
+    n_suffix = len(suffix_tokens)
+    full_token_ids = (
+        [t["token_id"] for t in prefix_tokens]
+        + [t["token_id"] for t in grid_tokens]
+        + [t["token_id"] for t in suffix_tokens]
+    )
+    prompt_len = n_prefix + n_grid + n_suffix
+    return {
+        "label": label,
+        "variant": variant,
+        "traj": f"simple_corridor_{variant}",
+        "step_id": 0,
+        "pos": list(SIMPLE_CORRIDOR_TARGET_CELL),
+        "agent_action_recorded": "UP" if carrying_key else "DOWN",
+        "n_prefix": n_prefix,
+        "n_grid": n_grid,
+        "n_suffix": n_suffix,
+        "prompt_len": prompt_len,
+        "suffix_positions": [prompt_len - 3, prompt_len - 2, prompt_len - 1],
+        "full_token_ids": full_token_ids,
+        "grid_source": "synthetic simple corridor; K visible in both prompts",
+    }
 
 
 def parse_pos(grid_state):
@@ -88,7 +170,7 @@ def parse_pos(grid_state):
         if not m:
             continue
         r = int(m.group(1))
-        cells = row[m.end():].split()
+        cells = row[m.end() :].split()
         for c, x in enumerate(cells):
             if x == "A":
                 return (c, r)
@@ -107,10 +189,7 @@ def load_step_activations(act_dir: Path, traj_stem: str, step_id: int):
     files = sorted(folder.iterdir(), key=lambda p: int(p.stem))
     if len(files) < N_DONOR_TOKENS:
         return None
-    vecs = [
-        torch.load(p, map_location="cpu", weights_only=True).float()
-        for p in files[:N_DONOR_TOKENS]
-    ]
+    vecs = [torch.load(p, map_location="cpu", weights_only=True).float() for p in files[:N_DONOR_TOKENS]]
     return torch.stack(vecs, dim=0)
 
 
@@ -133,15 +212,21 @@ def find_visit(traj_dir: Path, target_variant: str, target_cell: tuple[int, int]
     return candidates[0]
 
 
-def build_prompt_row(label: str, variant: str, traj_stem: str, step_id: int,
-                     agent_action: str, tj: dict,
-                     grid_tokens_override: list | None = None,
-                     grid_source_note: str | None = None,
-                     prefix_tokens_override: list | None = None) -> dict:
+def build_prompt_row(
+    label: str,
+    variant: str,
+    traj_stem: str,
+    step_id: int,
+    agent_action: str,
+    tj: dict,
+    grid_tokens_override: list | None = None,
+    grid_source_note: str | None = None,
+    prefix_tokens_override: list | None = None,
+) -> dict:
     # Trajectory-level prefix is static template text (no flag placeholders).
-    prefix_tokens = (prefix_tokens_override
-                     if prefix_tokens_override is not None
-                     else tj["prompt"]["prompt_prefix_tokens"])
+    prefix_tokens = (
+        prefix_tokens_override if prefix_tokens_override is not None else tj["prompt"]["prompt_prefix_tokens"]
+    )
     n_prefix = len(prefix_tokens)
     # IMPORTANT: use the STEP-RENDERED suffix (`Carrying key: True/False`),
     # not the trajectory-level template suffix (which contains literal
@@ -185,23 +270,27 @@ def diff_suffix_text(row_a: dict, row_b: dict) -> str:
     pa, pb = row_a["full_token_ids"], row_b["full_token_ids"]
     suffix_start_a = row_a["n_prefix"] + row_a["n_grid"]
     suffix_start_b = row_b["n_prefix"] + row_b["n_grid"]
-    out.append(f"  prompt a length: {row_a['prompt_len']}  "
-               f"(prefix={row_a['n_prefix']} + grid={row_a['n_grid']} + suffix={row_a['n_suffix']})")
-    out.append(f"  prompt b length: {row_b['prompt_len']}  "
-               f"(prefix={row_b['n_prefix']} + grid={row_b['n_grid']} + suffix={row_b['n_suffix']})")
+    out.append(
+        f"  prompt a length: {row_a['prompt_len']}  "
+        f"(prefix={row_a['n_prefix']} + grid={row_a['n_grid']} + suffix={row_a['n_suffix']})"
+    )
+    out.append(
+        f"  prompt b length: {row_b['prompt_len']}  "
+        f"(prefix={row_b['n_prefix']} + grid={row_b['n_grid']} + suffix={row_b['n_suffix']})"
+    )
     suffix_a = pa[suffix_start_a:]
     suffix_b = pb[suffix_start_b:]
     out.append(f"  suffix-region token IDs match: {suffix_a == suffix_b}")
     if suffix_a != suffix_b:
-        for i, (ta, tb) in enumerate(zip(suffix_a, suffix_b)):
+        for i, (ta, tb) in enumerate(zip(suffix_a, suffix_b, strict=False)):
             if ta != tb:
                 out.append(f"    suffix offset {i}: a={ta}  vs  b={tb}")
     # Find token IDs in the *grid* region that differ. Prompt grids may differ
     # in the K cell; suffix should differ at the True/False slot only.
-    grid_a = pa[row_a["n_prefix"]: row_a["n_prefix"] + row_a["n_grid"]]
-    grid_b = pb[row_b["n_prefix"]: row_b["n_prefix"] + row_b["n_grid"]]
+    grid_a = pa[row_a["n_prefix"] : row_a["n_prefix"] + row_a["n_grid"]]
+    grid_b = pb[row_b["n_prefix"] : row_b["n_prefix"] + row_b["n_grid"]]
     if len(grid_a) == len(grid_b):
-        ndiff = sum(1 for x, y in zip(grid_a, grid_b) if x != y)
+        ndiff = sum(1 for x, y in zip(grid_a, grid_b, strict=True) if x != y)
         out.append(f"  grid region: same length ({len(grid_a)}), {ndiff} differing token positions")
     else:
         out.append(f"  grid region length differs: a={len(grid_a)}  b={len(grid_b)}")
@@ -210,23 +299,69 @@ def diff_suffix_text(row_a: dict, row_b: dict) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--traj-dir", type=Path,
-                    default=Path("/Users/wws/interp/data/trajectories/fourroom_episode_sweep_T0"))
-    ap.add_argument("--act-dir", type=Path,
-                    default=Path("/Users/wws/interp/data/activations/fourroom_episode_sweep_T0"))
-    ap.add_argument("--out-dir", type=Path,
-                    default=Path("/Users/wws/interp/flag_swap"))
+    ap.add_argument(
+        "--traj-dir", type=Path, default=Path("/Users/wws/interp/data/trajectories/fourroom_episode_sweep_T0")
+    )
+    ap.add_argument(
+        "--act-dir", type=Path, default=Path("/Users/wws/interp/data/activations/fourroom_episode_sweep_T0")
+    )
+    ap.add_argument("--out-dir", type=Path, default=Path("/Users/wws/interp/flag_swap"))
     ap.add_argument("--target-cell", type=int, nargs=2, default=list(TARGET_CELL))
-    ap.add_argument("--rewrite-prefix", action="store_true",
-                    help="Apply PREFIX_REWRITES to fix the K-visible-while-carrying "
-                         "contradiction in the instructions block.")
-    ap.add_argument("--tokenizer", type=str, default="openai/gpt-oss-20b",
-                    help="Tokenizer used for prefix rewrite (must match the model used "
-                         "in the MLX intervention).")
+    ap.add_argument(
+        "--rewrite-prefix",
+        action="store_true",
+        help="Apply PREFIX_REWRITES to fix the K-visible-while-carrying contradiction in the instructions block.",
+    )
+    ap.add_argument(
+        "--simple-corridor",
+        action="store_true",
+        help="Build a synthetic 3x8 corridor prompt instead of using recorded four-room grid tokens.",
+    )
+    ap.add_argument(
+        "--tokenizer",
+        type=str,
+        default="openai/gpt-oss-20b",
+        help="Tokenizer used for prefix rewrite (must match the model used in the MLX intervention).",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cell = tuple(args.target_cell)
+
+    if args.simple_corridor:
+        from transformers import AutoTokenizer  # local import: heavy
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        template_tj = load_template_trajectory(args.traj_dir)
+        prefix_tokens = template_tj["prompt"]["prompt_prefix_tokens"]
+        if args.rewrite_prefix:
+            prefix_tokens = rewrite_prefix(prefix_tokens, tokenizer)
+            print(
+                f"  prefix rewrite: {len(template_tj['prompt']['prompt_prefix_tokens'])} "
+                f"-> {len(prefix_tokens)} tokens ({len(PREFIX_REWRITES)} sentence replacements applied)"
+            )
+
+        grid_text = render_grid(SIMPLE_CORRIDOR_ROWS)
+        grid_tokens = encode_token_dicts(grid_text, tokenizer, ["prompt", "grid_state"])
+        row_a = build_synthetic_prompt_row(
+            "a", "K0D0", False, prefix_tokens, grid_tokens, build_suffix_tokens(False, tokenizer)
+        )
+        row_b = build_synthetic_prompt_row(
+            "b", "K1D0", True, prefix_tokens, grid_tokens, build_suffix_tokens(True, tokenizer)
+        )
+
+        print("Simple corridor grid:")
+        print(grid_text)
+        print("\nPrompt diff (decoded-text-free; token-level):")
+        print(diff_suffix_text(row_a, row_b))
+
+        prompts_path = args.out_dir / "prompts.jsonl"
+        with open(prompts_path, "w") as f:
+            for row in (row_a, row_b):
+                f.write(json.dumps(row) + "\n")
+        print(f"\nWrote {prompts_path}")
+        print("Synthetic mode: skipped disk activation snapshots; the MLX runner captures activations live.")
+        return
 
     print(f"Looking for K0D0 and K1D0 visits at cell {cell} ...")
     a = find_visit(args.traj_dir, "K0D0", cell)
@@ -246,23 +381,32 @@ def main():
     # the suffix — which is the variable we want to test causally.
     a_step_obj = next(s for s in a_tj["steps"] if s["step_id"] == a_step)
     a_grid_tokens = a_step_obj["grid_state_tokens"]
-    print(f"  symmetric-grid override: prompt b grid_state_tokens "
-          f"<-- {a_stem}/step_{a_step} ({len(a_grid_tokens)} tokens)")
+    print(
+        f"  symmetric-grid override: prompt b grid_state_tokens "
+        f"<-- {a_stem}/step_{a_step} ({len(a_grid_tokens)} tokens)"
+    )
 
     # Optional prefix rewrite: fix the K-visible-while-carrying contradiction.
     new_prefix = None
     if args.rewrite_prefix:
         from transformers import AutoTokenizer  # local import: heavy
+
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
         original_prefix = a_tj["prompt"]["prompt_prefix_tokens"]
         new_prefix = rewrite_prefix(original_prefix, tokenizer)
-        print(f"  prefix rewrite: {len(original_prefix)} -> {len(new_prefix)} tokens "
-              f"({len(PREFIX_REWRITES)} sentence replacements applied)")
+        print(
+            f"  prefix rewrite: {len(original_prefix)} -> {len(new_prefix)} tokens "
+            f"({len(PREFIX_REWRITES)} sentence replacements applied)"
+        )
 
-    row_a = build_prompt_row("a", "K0D0", a_stem, a_step, a_action, a_tj,
-                             prefix_tokens_override=new_prefix)
+    row_a = build_prompt_row("a", "K0D0", a_stem, a_step, a_action, a_tj, prefix_tokens_override=new_prefix)
     row_b = build_prompt_row(
-        "b", "K1D0", b_stem, b_step, b_action, b_tj,
+        "b",
+        "K1D0",
+        b_stem,
+        b_step,
+        b_action,
+        b_tj,
         grid_tokens_override=a_grid_tokens,
         grid_source_note=f"{a_stem}/step_{a_step} (symmetric override; always shows K)",
         prefix_tokens_override=new_prefix,
@@ -280,15 +424,21 @@ def main():
         raise SystemExit(f"missing activations for prompt b: {b_stem}/step_{b_step}")
     act_a_bf = act_a.to(torch.bfloat16)
     act_b_bf = act_b.to(torch.bfloat16)
-    print(f"\nact_a shape={tuple(act_a_bf.shape)} dtype={act_a_bf.dtype} "
-          f"norm-per-token={[round(a.float().norm().item(), 2) for a in act_a_bf]}")
-    print(f"act_b shape={tuple(act_b_bf.shape)} dtype={act_b_bf.dtype} "
-          f"norm-per-token={[round(b.float().norm().item(), 2) for b in act_b_bf]}")
+    print(
+        f"\nact_a shape={tuple(act_a_bf.shape)} dtype={act_a_bf.dtype} "
+        f"norm-per-token={[round(a.float().norm().item(), 2) for a in act_a_bf]}"
+    )
+    print(
+        f"act_b shape={tuple(act_b_bf.shape)} dtype={act_b_bf.dtype} "
+        f"norm-per-token={[round(b.float().norm().item(), 2) for b in act_b_bf]}"
+    )
     # Distance between act_a and act_b
     diff = (act_a.float() - act_b.float()).norm(dim=-1)
-    print(f"||act_a − act_b|| per token = {[round(d.item(), 2) for d in diff]}  "
-          f"(NOTE: disk-loaded act_b is from the *original* K1D0 prompt — "
-          f"the MLX runner re-captures activations live from the symmetric prompt.)")
+    print(
+        f"||act_a − act_b|| per token = {[round(d.item(), 2) for d in diff]}  "
+        f"(NOTE: disk-loaded act_b is from the *original* K1D0 prompt — "
+        f"the MLX runner re-captures activations live from the symmetric prompt.)"
+    )
 
     # Save
     prompts_path = args.out_dir / "prompts.jsonl"

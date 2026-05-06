@@ -1,6 +1,7 @@
 """Utility functions for gathering activations."""
 
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -18,6 +19,26 @@ KNOWN_TOKEN_GROUPS = {
     "final",
     "action",
 }
+
+_TOKEN_GROUP_SPEC_RE = re.compile(r"^@?(?P<group>[A-Za-z_][A-Za-z0-9_-]*)(?:/(?P<stride>\d+))?$")
+_RANGE_SPEC_RE = re.compile(r"^\s*(-?\d+)\s*(?::|-)\s*(-?\d+)\s*$")
+
+
+def _parse_token_group_specification(spec: str) -> tuple[str, int | None]:
+    """Parse a token-group specification into a group name and optional stride."""
+    match = _TOKEN_GROUP_SPEC_RE.match(spec.strip())
+    if match is None:
+        raise ValueError(f"Invalid token group specification: '{spec}'")
+
+    group_name = match.group("group").lower()
+    stride_raw = match.group("stride")
+    if stride_raw is None:
+        return group_name, None
+
+    stride = int(stride_raw)
+    if stride <= 0:
+        raise ValueError(f"Token group stride must be positive in specification: '{spec}'")
+    return group_name, stride
 
 
 def is_token_group_specification(spec: str) -> bool:
@@ -40,7 +61,8 @@ def is_token_group_specification(spec: str) -> bool:
         return True
 
     # Check against known token groups
-    return spec_stripped in KNOWN_TOKEN_GROUPS
+    group_name = spec_stripped.split("/", maxsplit=1)[0]
+    return group_name in KNOWN_TOKEN_GROUPS
 
 
 def get_indices_for_token_group(tokens: list[dict], group_name: str) -> list[int]:
@@ -57,7 +79,7 @@ def get_indices_for_token_group(tokens: list[dict], group_name: str) -> list[int
         ValueError: If no tokens match the specified group
     """
     # Remove @ prefix if present
-    group_name = group_name.lstrip("@").strip()
+    group_name = group_name.lstrip("@").strip().lower()
 
     indices = []
     for token in tokens:
@@ -102,6 +124,7 @@ def parse_index_specification(spec: str, max_index: int, clamp: bool = False) ->
         - "all" -> all indices from 0 to max_index-1
         - "0,1,5" -> specific indices
         - "0:10" -> range (inclusive)
+        - "0-10" -> range (inclusive, legacy syntax)
         - "-1" -> last index (max_index-1)
         - "-3:-1" -> last 3 indices
         - "0,5:10,-1" -> mixed format
@@ -121,6 +144,11 @@ def parse_index_specification(spec: str, max_index: int, clamp: bool = False) ->
     if spec.strip().lower() == "all":
         return list(range(max_index))
 
+    if max_index <= 0:
+        if clamp:
+            return []
+        raise ValueError(f"Cannot resolve indices against empty range [0, {max_index})")
+
     indices = set()
 
     # Split by comma
@@ -131,16 +159,12 @@ def parse_index_specification(spec: str, max_index: int, clamp: bool = False) ->
         if not part:
             continue
 
-        # Check if this is a range (contains : separator)
-        # A range looks like: "0:10", "-3:-1", "5:-1", "-5:10"
-        if ":" in part:
-            range_parts = part.split(":")
-            if len(range_parts) != 2:
-                raise ValueError(f"Invalid range specification: '{part}'")
-
-            start_str, end_str = range_parts
-            start_idx = int(start_str.strip())
-            end_idx = int(end_str.strip())
+        # Check if this is a range. Supported forms: "0:10", "-3:-1", "0-10", "-3--1".
+        range_match = _RANGE_SPEC_RE.match(part)
+        if range_match is not None:
+            start_str, end_str = range_match.groups()
+            start_idx = int(start_str)
+            end_idx = int(end_str)
 
             # Resolve negative indices
             if start_idx < 0:
@@ -281,7 +305,8 @@ def build_truncated_input(
     """
     prefix_ids = [t["token_id"] for t in trajectory["prompt"]["prompt_prefix_tokens"]]
     grid_ids = [t["token_id"] for t in step["grid_state_tokens"]]
-    suffix_ids = [t["token_id"] for t in trajectory["prompt"]["prompt_suffix_tokens"]]
+    suffix_tokens = step.get("prompt_suffix_tokens", trajectory["prompt"]["prompt_suffix_tokens"])
+    suffix_ids = [t["token_id"] for t in suffix_tokens]
     output_ids = [t["token_id"] for t in step["output_tokens"]]
 
     # Concatenate all token IDs
@@ -348,10 +373,24 @@ def resolve_token_indices(
     Returns:
         List of token indices to extract
     """
-    if is_token_group_specification(spec):
-        group_name = spec.lstrip("@").strip()
-        indices = get_indices_for_token_group(tokens, group_name)
-        print(f"      Token group '{group_name}' matched {len(indices)} tokens in {category_name}")
-        return indices
-    else:
-        return parse_index_specification(spec, len(tokens))
+    indices: set[int] = set()
+    for part_raw in spec.split(","):
+        part = part_raw.strip()
+        if not part:
+            continue
+
+        if is_token_group_specification(part):
+            group_name, stride = _parse_token_group_specification(part)
+            group_indices = get_indices_for_token_group(tokens, group_name)
+            if stride is not None:
+                group_indices = group_indices[::stride]
+                print(
+                    f"      Token group '{group_name}'/{stride} matched {len(group_indices)} tokens in {category_name}"
+                )
+            else:
+                print(f"      Token group '{group_name}' matched {len(group_indices)} tokens in {category_name}")
+            indices.update(group_indices)
+        else:
+            indices.update(parse_index_specification(part, len(tokens)))
+
+    return sorted(indices)

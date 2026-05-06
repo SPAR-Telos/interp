@@ -1,0 +1,53 @@
+# Seed12 Optimal-Action Direction Steering
+
+## Setup
+
+This report aggregates real Seed12 trajectory-step steering results. The hooked condition adds `alpha * class_gap * direction` to each of the final three step-specific prompt-suffix tokens. The no-hook baseline is separate from the alpha 0 hook baseline.
+
+- Results: `data/steering/Seed12_T0_state_sweep_optimal_action/steering_results_targeted_layer23_true_to_down.jsonl`
+- Layers: 23
+- Hooked alphas: -64, -8, 0, 8, 64
+
+## Main Rates
+
+| layer | condition | alpha | n | optimal action rate | true action rate | nonoptimal-to-optimal rate | delta optimal vs no-hook | delta true vs no-hook |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 23 | no_hook |  | 10 | 0.000 | 1.000 | 0.000 | 0.000 | 0.000 |
+| 23 | hooked | -64 | 10 | 0.000 | 1.000 | 0.000 | 0.000 | 0.000 |
+| 23 | hooked | -8 | 10 | 0.000 | 1.000 | 0.000 | 0.000 | 0.000 |
+| 23 | hooked | 0 | 10 | 0.000 | 1.000 | 0.000 | 0.000 | 0.000 |
+| 23 | hooked | 8 | 10 | 0.000 | 1.000 | 0.000 | 0.000 | 0.000 |
+| 23 | hooked | 64 | 10 | 0.000 | 1.000 | 0.000 | 0.000 | 0.000 |
+
+## Alpha 0 No-Op Check
+
+| layer | pairs | same seed rate | same action rate | same text-tail rate | missing pairs |
+|---:|---:|---:|---:|---:|---:|
+| 23 | 10 | 1.000 | 1.000 | 1.000 | 0 |
+
+## Paired Causal Effects
+
+| layer | alpha | pairs | changed action rate | nonoptimal-to-optimal rate | optimal-to-nonoptimal rate | true-to-not-true rate |
+|---:|---:|---:|---:|---:|---:|---:|
+| 23 | -64 | 10 | 0.000 | 0.000 | 0.000 | 0.000 |
+| 23 | -8 | 10 | 0.000 | 0.000 | 0.000 | 0.000 |
+| 23 | 0 | 10 | 0.000 | 0.000 | 0.000 | 0.000 |
+| 23 | 8 | 10 | 0.000 | 0.000 | 0.000 | 0.000 |
+| 23 | 64 | 10 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+## Interpretation
+
+The largest optimal-action improvement versus no-hook is layer 23 at alpha -64: optimal-action rate 0.000, delta 0.000.
+
+The largest true-action retention drop versus no-hook is layer 23 at alpha -64: true-action rate 1.000, delta 0.000.
+
+These are distinct behavioral claims. A higher optimal-action rate means the model more often emits an action in `astar_actions`. A lower true-action rate means the model moved away from the recorded `agent_action`. Those can move in opposite directions because many recorded true actions are not in the optimal set.
+
+## Artifacts
+
+- `summary_by_layer_alpha.csv`
+- `noop_baseline_agreement.csv`
+- `paired_effects_vs_no_hook.csv`
+- `optimal_action_rate_vs_alpha.svg`
+- `true_action_rate_vs_alpha.svg`
+- `nonoptimal_to_optimal_rate_vs_alpha.svg`
