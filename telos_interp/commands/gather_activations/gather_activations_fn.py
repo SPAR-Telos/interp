@@ -5,7 +5,7 @@ from glob import glob
 from pathlib import Path
 
 import torch
-from nnterp import StandardizedTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 from .gather_activations_utils import (
@@ -41,7 +41,7 @@ def _resolve_torch_dtype(torch_dtype: str, model_id: str) -> torch.dtype | None:
 
 def _process_single_trajectory(
     trajectory: dict,
-    model: StandardizedTransformer,
+    model: torch.nn.Module,
     output_base: Path,
     layer_indices: list[int],
     step_indices: list[int],
@@ -121,7 +121,7 @@ def _process_single_trajectory(
 def _process_single_step(
     trajectory: dict,
     step: dict,
-    model: StandardizedTransformer,
+    model: torch.nn.Module,
     output_base: Path,
     layer_indices: list[int],
     n_prefix: int,
@@ -249,10 +249,16 @@ def extract_activations_from_trajectories(
         layers: Layer indices to extract (e.g., "all", "0:10", "-1")
         steps: Step indices to extract (e.g., "all", "0:10", "-1"). Uses same format as layers.
             Out-of-bounds indices are clamped, so "0:10" selects up to 10 steps if available.
-        prompt_prefix_indices: Indices for prompt_prefix tokens (None = skip)
-        prompt_suffix_indices: Indices for prompt_suffix tokens (None = skip)
-        grid_state_indices: Indices for grid_state tokens (None = skip)
-        output_indices: Indices for output tokens (None = skip)
+        prompt_prefix_indices: Indices for prompt_prefix tokens (None = skip).
+            Accepts numeric specs ("all", "-1", "0:5"), token group names
+            ("analysis", "final"), or "eos" (tokens ending in . ! ?).
+        prompt_suffix_indices: Indices for prompt_suffix tokens (None = skip).
+            Same format as prompt_prefix_indices.
+        grid_state_indices: Indices for grid_state tokens (None = skip).
+            Same format as prompt_prefix_indices.
+        output_indices: Indices for output tokens (None = skip).
+            Same format as prompt_prefix_indices. Use "eos" to gather only
+            at sentence-ending tokens (those ending in '.', '!', or '?').
         device_map: Device mapping for model loading
         torch_dtype: Torch dtype for model ("auto", "bfloat16", "float16")
         debug: If True, print the first truncated input text to verify format
@@ -281,8 +287,13 @@ def extract_activations_from_trajectories(
     # Determine torch_dtype
     resolved_dtype = _resolve_torch_dtype(torch_dtype, model_id)
 
-    # Load model using nnterp
-    model = StandardizedTransformer(model_id, device_map=device_map, torch_dtype=resolved_dtype)
+    # Load model using Transformers.
+    # Activations are captured later via PyTorch forward hooks in extract_activations_single_pass.
+    dtype = resolved_dtype if resolved_dtype is not None else "auto"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, device_map=device_map, dtype=dtype)
+    model.eval()
+    model.tokenizer = tokenizer  # attach so the debug decode paths keep working
 
     num_layers = model.config.num_hidden_layers
     print(f"Model has {num_layers} layers")

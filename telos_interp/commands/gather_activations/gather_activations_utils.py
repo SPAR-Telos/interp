@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 import torch
-from nnterp import StandardizedTransformer
 
 # Known token groups from the trace viewer format
 KNOWN_TOKEN_GROUPS = {
@@ -68,6 +67,30 @@ def get_indices_for_token_group(tokens: list[dict], group_name: str) -> list[int
     if not indices:
         raise ValueError(f"No tokens found with token_group '{group_name}'")
 
+    return sorted(indices)
+
+
+_EOS_PUNCTUATION = {".", "!", "?"}
+_BPE_TRAILING = "Ċ\n "
+
+
+def get_indices_for_eos_tokens(tokens: list[dict]) -> list[int]:
+    """Get token indices where decoded text ends a sentence.
+
+    Detects tokens whose text ends with '.', '!', or '?' after stripping
+    trailing BPE whitespace/newline artifacts ('Ċ', newline, space).
+
+    Args:
+        tokens: List of token dicts with 'id' and 'token' keys
+
+    Returns:
+        Sorted list of token indices at sentence endings (may be empty)
+    """
+    indices = []
+    for token in tokens:
+        text = token.get("token", "").rstrip(_BPE_TRAILING)
+        if text and text[-1] in _EOS_PUNCTUATION:
+            indices.append(token["id"])
     return sorted(indices)
 
 
@@ -203,16 +226,46 @@ def sanitize_model_id(model_id: str) -> str:
     return model_id.replace("/", "__")
 
 
+def _get_decoder_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
+    """Locate the decoder block list across common HF causal-LM layouts.
+    
+    Previously done via nnterp; this is a re-implementation of the same logic to avoid nnterp dependency.
+    Replaces nnterp's name standardization: for gpt-oss / Llama-family models the
+    blocks live at ``model.model.layers``. Other layouts are tried as fallbacks.
+
+    Args:
+        model: A HuggingFace causal-LM model
+
+    Returns:
+        The ModuleList of decoder blocks
+
+    Raises:
+        AttributeError: If no known decoder-layer path is found
+    """
+    for path in ("model.layers", "transformer.h", "gpt_neox.layers", "model.decoder.layers"):
+        obj = model
+        try:
+            for attr in path.split("."):
+                obj = getattr(obj, attr)
+            return obj
+        except AttributeError:
+            continue
+    raise AttributeError("Could not locate decoder layers on model")
+
+
 def extract_activations_single_pass(
-    model: StandardizedTransformer,
+    model: torch.nn.Module,
     input_ids: torch.Tensor,
     token_indices: list[int],
     layer_indices: list[int],
 ) -> dict[int, dict[int, torch.Tensor]]:
     """Extract activations for specific tokens at specified layers in a single forward pass.
 
+    Captures the raw residual-stream output of each requested decoder block via
+    PyTorch forward hooks (equivalent to nnterp's ``layers_output[i]``).
+
     Args:
-        model: nnterp StandardizedTransformer model
+        model: HuggingFace causal-LM model
         input_ids: Tokenized input tensor of shape (1, seq_len), should be truncated
             to include only tokens up to the last position needed
         token_indices: List of absolute token indices to extract
@@ -227,39 +280,39 @@ def extract_activations_single_pass(
         invalid = [idx for idx in token_indices if idx >= seq_len]
         print(f"Warning: Skipping {len(invalid)} token indices beyond sequence length {seq_len}")
 
-    # Move input_ids to the model's device (important for multi-GPU setups with device_map="auto")
-    # Get the device of the embedding layer as the input device
+    # Move input_ids to the model's device (important for device_map="auto" setups)
     try:
-        model_device = next(model.model.parameters()).device
+        model_device = next(model.parameters()).device
         input_ids = input_ids.to(model_device)
     except StopIteration:
         pass  # No parameters found, keep input_ids on CPU
 
+    decoder_layers = _get_decoder_layers(model)
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(idx: int):
+        def hook(_module, _inputs, output):
+            # decoder blocks may return a tuple (hidden_states, ...) or a bare tensor
+            captured[idx] = output[0] if isinstance(output, tuple) else output
+
+        return hook
+
+    for layer_idx in layer_indices:
+        handles.append(decoder_layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+
+    try:
+        with torch.no_grad():
+            model(input_ids, use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+
     results: dict[int, dict[int, torch.Tensor]] = {layer_idx: {} for layer_idx in layer_indices}
-    activations_to_save = []
-
-    # Sync all devices before tracing (important for multi-GPU MoE models)
-    if torch.cuda.is_available():
-        for device_idx in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(device_idx)
-
-    with torch.no_grad():
-        with model.trace(input_ids):
-            for layer_idx in layer_indices:
-                layer_output = model.layers_output[layer_idx]
-                for token_idx in valid_indices:
-                    activation = layer_output[0, token_idx, :].save()
-                    activations_to_save.append((layer_idx, token_idx, activation))
-
-    # Sync all devices after tracing
-    if torch.cuda.is_available():
-        for device_idx in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(device_idx)
-
-    for layer_idx, token_idx, activation in activations_to_save:
-        # Convert to tensor and move to CPU
-        act_tensor = activation.detach().cpu().clone()
-        results[layer_idx][token_idx] = act_tensor
+    for layer_idx in layer_indices:
+        layer_output = captured[layer_idx]
+        for token_idx in valid_indices:
+            results[layer_idx][token_idx] = layer_output[0, token_idx, :].detach().cpu().clone()
 
     return results
 
@@ -348,7 +401,11 @@ def resolve_token_indices(
     Returns:
         List of token indices to extract
     """
-    if is_token_group_specification(spec):
+    if spec.strip().lower() == "eos":
+        indices = get_indices_for_eos_tokens(tokens)
+        print(f"      EOS mode: {len(indices)} sentence-ending tokens in {category_name}")
+        return indices
+    elif is_token_group_specification(spec):
         group_name = spec.lstrip("@").strip()
         indices = get_indices_for_token_group(tokens, group_name)
         print(f"      Token group '{group_name}' matched {len(indices)} tokens in {category_name}")
